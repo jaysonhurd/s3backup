@@ -16,22 +16,22 @@ import (
 	"time"
 )
 
-func BackupDir (cfg *models.Config, s *session.Session, dir string)  {
-
-	tmpDir, err := prepareTestDirTree(dir)
+func BackupDirectory(s *backupData) () {
+	tmpDir, err := prepareTestDirTree(s.dir)
 	if err != nil {
 		log.Fatal(err)
 		return
 	}
-	//defer os.RemoveAll(tmpDir)
+	defer os.RemoveAll(tmpDir)
+
 	os.Chdir(tmpDir)
 
- 	err = filepath.Walk(dir, func(path string, info fs.FileInfo, err error) error {
+ 	err = filepath.Walk(s.dir, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
 			log.Fatal(err)
 			return err
 		}
-		s3objectTime, err := getS3HeadObjectTimestamp(cfg, s, path)
+		s3objectTime, err := getS3FileTimestamp(&s.cfg, &s.awsSess, path)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -39,9 +39,9 @@ func BackupDir (cfg *models.Config, s *session.Session, dir string)  {
 
 		localFileTime := getLocalFileTimestamp(path)
 
-		if localFileTime.UnixMicro() > s3objectTime2.UnixMicro() {
-			fmt.Printf("Backing up file: %q to AWS S3 storage type %s\n", path, cfg.StorageClass)
-			err = uploadFileToS3(cfg, s, path)
+		if localFileTime.Unix() > s3objectTime2.Unix() {
+			fmt.Printf("Backing up file: %q to AWS S3 storage type %s\n", path, s.cfg.StorageClass)
+			err = uploadFileToS3(&s.cfg, &s.awsSess, path)
 		} else {
 			fmt.Printf("SKIPPING File: %q is same date or older than the version in S3\n", path)
 		}
@@ -63,13 +63,12 @@ func getLocalFileTimestamp(file string) time.Time {
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	return filestat.ModTime()
 }
 
-func getS3HeadObjectTimestamp (cfg *models.Config, s *session.Session, file string) (*time.Time, error) {
+func getS3FileTimestamp(cfg *models.Config, sess *session.Session, file string) (*time.Time, error) {
 
-	svc :=s3.New(s)
+	svc :=s3.New(sess)
 
 	input := &s3.HeadObjectInput{
 		Bucket: aws.String(cfg.S3Bucket),
@@ -82,21 +81,19 @@ func getS3HeadObjectTimestamp (cfg *models.Config, s *session.Session, file stri
 		if aerr, ok := err.(awserr.Error); ok {
 			switch aerr.Code() {
 			case "NotFound":
-				//location, _ := time.LoadLocation("US/Denver")
-				epoch := time.Date(2000, 01, 01, 01, 01, 01, 1, time.UTC)
+				epoch := time.Date(1970, 01, 01, 01, 01, 01, 1, time.UTC)
 				return &epoch, nil
 			default:
 				log.Fatal(err)
 			}
 		} else {
-			return result.LastModified, nil
+			return result.LastModified, err
 		}
-		//return result.LastModified, nil
 	}
 	return result.LastModified, nil
 }
 
-func uploadFileToS3(cfg *models.Config, s *session.Session, fileName string) error {
+func uploadFileToS3(cfg *models.Config, sess *session.Session, fileName string) error {
 
 	fileName, file, err := openFile(fileName)
 	if err != nil {
@@ -110,7 +107,7 @@ func uploadFileToS3(cfg *models.Config, s *session.Session, fileName string) err
 	buffer := make([]byte, size)
 	file.Read(buffer)
 
-	_, s3err := s3.New(s).PutObject(&s3.PutObjectInput{
+	_, s3err := s3.New(sess).PutObject(&s3.PutObjectInput{
 		Bucket:               aws.String(cfg.S3Bucket),
 		Key:                  aws.String(fileName),
 		ACL:                  aws.String(cfg.ACL),
@@ -123,9 +120,7 @@ func uploadFileToS3(cfg *models.Config, s *session.Session, fileName string) err
 	})
 
 	return s3err
-
 }
-
 
 func prepareTestDirTree(tree string) (string, error) {
 	tmpDir, err := os.MkdirTemp("", "")
@@ -140,5 +135,14 @@ func prepareTestDirTree(tree string) (string, error) {
 	}
 
 	return tmpDir, nil
+}
+
+func openFile(fileName string) (string, *os.File, error) {
+	fileName, _ = filepath.Abs(fileName)
+	file, err := os.Open(fileName)
+	if err != nil {
+		return "", nil, err
+	}
+	return fileName, file, nil
 }
 

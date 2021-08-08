@@ -1,4 +1,4 @@
-package s3backup
+package utilities
 
 import (
 	"encoding/json"
@@ -8,7 +8,6 @@ import (
 	"github.com/jaysonhurd/s3backup/models"
 	"io/ioutil"
 	"os"
-	"path/filepath"
 )
 
 func CreateAWSSession(cfg *models.Config) (*session.Session, error) {
@@ -23,16 +22,6 @@ func CreateAWSSession(cfg *models.Config) (*session.Session, error) {
 	return s, err
 }
 
-
-func openFile(fileName string) (string, *os.File, error) {
-	fileName, _ = filepath.Abs(fileName)
-	file, err := os.Open(fileName)
-	if err != nil {
-		return "", nil, err
-	}
-	return fileName, file, nil
-}
-
 func LoadConfig (configFile string) (*models.Config, error) {
 	var BackupConfig *models.Config
 	_, err := os.Stat(configFile)
@@ -40,9 +29,9 @@ func LoadConfig (configFile string) (*models.Config, error) {
 		return BackupConfig, err
 	}
 	f, err := ioutil.ReadFile(configFile)
-	if err != nil {
+	/*if err != nil {
 		return BackupConfig, err
-	}
+	}*/
 	err = json.Unmarshal(f, &BackupConfig)
 	if err != nil {
 		return BackupConfig, err
