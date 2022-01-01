@@ -1,5 +1,5 @@
-test*file
-*.json
+config.json
+!fixtures/tests/*.json
 go_build*
 ./idea*
 .idea*
