@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/jaysonhurd/s3backup/models"
@@ -16,66 +15,81 @@ import (
 	"time"
 )
 
-type S3backup interface {
-	BackupDirectory()
-	SetConfig(cfg models.Config)
-	SetAWSSession(sess session.Session)
-	SetDirectory(dir string)
+type S3backuper interface {
+	BackupDirectory() (err error)
+	SetConfig(cfg models.Config) (err error)
+	SetAWSS3(svc s3iface.S3API) (err error)
+	SetDirectory(dir string) (err error)
 }
 
 type s3backup struct {
-	cfg     models.Config
-	awsSess session.Session
-	Client  s3iface.S3API
-	dir     string
-	l       *zerolog.Logger
+	cfg models.Config
+	svc s3iface.S3API
+	dir string
+	l   *zerolog.Logger
 }
 
-// Constructor for backing up a single directory
-func CreateBackup(cfg models.Config, sess session.Session, dir string, logger *zerolog.Logger) *s3backup {
+func New(
+	cfg models.Config,
+	svc s3iface.S3API,
+	dir string,
+	l *zerolog.Logger,
+) S3backuper {
 	return &s3backup{
-		cfg:     cfg,
-		awsSess: sess,
-		dir:     dir,
-		l:       logger,
+		cfg: cfg,
+		svc: svc,
+		dir: dir,
+		l:   l,
 	}
 }
 
 //TODO: implement validation
-func (b *s3backup) SetConfig(cfg models.Config) {
+func (b *s3backup) SetConfig(cfg models.Config) (err error) {
 	b.cfg = cfg
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 //TODO: implement validation
-func (b *s3backup) SetAWSSession(sess session.Session) {
-	b.awsSess = sess
+func (b *s3backup) SetAWSS3(svc s3iface.S3API) (err error) {
+	b.svc = svc
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 //TODO: implement validation
-func (b *s3backup) SetDirectory(dir string) {
+func (b *s3backup) SetDirectory(dir string) (err error) {
 	b.dir = dir
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // This method backs up an enitre directory structure from the config.json file.
 // It will structure the file structure in S3 exactly as it is on the local filesystem.
-func (b *s3backup) BackupDirectory() {
+func (b *s3backup) BackupDirectory() (err error) {
 
-	err := filepath.Walk(b.dir, func(path string, info fs.FileInfo, err error) error {
+	err = filepath.Walk(b.dir, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
 			b.l.Fatal().Err(err)
 			return err
 		}
-		s3objectTime, err := getS3FileTimestamp(&b.cfg, &b.awsSess, path, b.l)
+		s3objectTime, err := b.getS3FileTimestamp(b.cfg, path)
 		if err != nil {
 			b.l.Fatal().Err(err)
 		}
 		var s3objectTime2 = *s3objectTime
 
-		localFileTime, err := getLocalFileTimestamp(path, b.l)
+		localFileTime, err := b.getLocalFileTimestamp(path)
 
 		if localFileTime.Unix() > s3objectTime2.Unix() {
 			b.l.Info().Msgf("BACKING UP FILE: %q to AWS S3 storage type %s", path, b.cfg.AWS.StorageClass)
-			err = uploadFileToS3(&b.cfg, &b.awsSess, path, b.l)
+			err = b.uploadFileToS3(b.cfg, path)
 		} else {
 			b.l.Info().Msgf("SKIPPING File: %q because it has the same or older timestamp than the version in S3", path)
 		}
@@ -86,30 +100,28 @@ func (b *s3backup) BackupDirectory() {
 		return nil
 	})
 	if err != nil {
-		b.l.Warn().Msgf("error walking the path %q: %v", err.Error())
+		b.l.Error().Msgf("error walking the path %q: %v", b.dir, err.Error())
 		return
 	}
 	return
 }
 
-func getLocalFileTimestamp(file string, l *zerolog.Logger) (time.Time, error) {
+func (b *s3backup) getLocalFileTimestamp(file string) (time.Time, error) {
 	filestat, err := os.Stat(file)
 	if err != nil {
-		l.Fatal().Err(err)
+		b.l.Fatal().Err(err)
 	}
 	return filestat.ModTime(), err
 }
 
-func getS3FileTimestamp(cfg *models.Config, sess *session.Session, file string, l *zerolog.Logger) (*time.Time, error) {
-
-	svc := s3.New(sess)
+func (b *s3backup) getS3FileTimestamp(cfg models.Config, file string) (*time.Time, error) {
 
 	input := &s3.HeadObjectInput{
 		Bucket: aws.String(cfg.AWS.S3Bucket),
 		Key:    aws.String(file),
 	}
 
-	result, err := svc.HeadObject(input)
+	result, err := b.svc.HeadObject(input)
 
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
@@ -118,7 +130,7 @@ func getS3FileTimestamp(cfg *models.Config, sess *session.Session, file string, 
 				epoch := time.Date(1970, 01, 01, 01, 01, 01, 1, time.UTC)
 				return &epoch, nil
 			default:
-				l.Fatal().Err(err)
+				b.l.Fatal().Err(err)
 			}
 		} else {
 			return result.LastModified, err
@@ -127,11 +139,11 @@ func getS3FileTimestamp(cfg *models.Config, sess *session.Session, file string, 
 	return result.LastModified, nil
 }
 
-func uploadFileToS3(cfg *models.Config, sess *session.Session, fileName string, l *zerolog.Logger) error {
+func (b *s3backup) uploadFileToS3(cfg models.Config, fileName string) error {
 
-	fileName, file, err := openFile(fileName)
+	fileName, file, err := b.openFile(fileName)
 	if err != nil {
-		l.Fatal().Err(err)
+		b.l.Fatal().Err(err)
 	}
 
 	defer file.Close()
@@ -141,7 +153,7 @@ func uploadFileToS3(cfg *models.Config, sess *session.Session, fileName string, 
 	buffer := make([]byte, size)
 	file.Read(buffer)
 
-	_, s3err := s3.New(sess).PutObject(&s3.PutObjectInput{
+	_, s3err := b.svc.PutObject(&s3.PutObjectInput{
 		Bucket:               aws.String(cfg.AWS.S3Bucket),
 		Key:                  aws.String(fileName),
 		ACL:                  aws.String(cfg.AWS.ACL),
@@ -153,11 +165,17 @@ func uploadFileToS3(cfg *models.Config, sess *session.Session, fileName string, 
 		StorageClass:         aws.String(cfg.AWS.StorageClass),
 	})
 
-	return s3err
+	if s3err != nil {
+		b.l.Error().Msgf("PutObject error: %s", s3err.Error())
+		return s3err
+	}
+
+	return nil
 }
 
-func openFile(fileName string) (string, *os.File, error) {
+func (b *s3backup) openFile(fileName string) (string, *os.File, error) {
 	fileName, _ = filepath.Abs(fileName)
+	//file := os.FileInfo()
 	file, err := os.Open(fileName)
 	if err != nil {
 		return "", nil, err

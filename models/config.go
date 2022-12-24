@@ -6,10 +6,10 @@ import (
 
 type Config struct {
 	AWS     AWS     `json:"AWS"`
-	Logging logging `json:"logging"`
+	Logging Logging `json:"Logging"`
 }
 
-type logging struct {
+type Logging struct {
 	LogfileLocation string `json:"logfile_location"`
 	MaxBackups      int    `json:"max_backups"`
 	MaxSize         int    `json:"max_size"`

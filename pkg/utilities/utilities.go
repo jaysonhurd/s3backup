@@ -16,7 +16,7 @@ import (
 
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 . Utilities
 
-func CreateAWSSession(cfg *models.Config, l *zerolog.Logger) (*session.Session, error) {
+func CreateAWSSession(cfg models.Config, l *zerolog.Logger) (*session.Session, error) {
 	s, err := session.NewSession(&aws.Config{
 		Region: aws.String(cfg.AWS.S3Region),
 		Credentials: credentials.NewStaticCredentials(
@@ -32,8 +32,8 @@ func CreateAWSSession(cfg *models.Config, l *zerolog.Logger) (*session.Session, 
 	return s, err
 }
 
-func LoadConfig(configFile string) (*models.Config, error) {
-	var BackupConfig *models.Config
+func LoadConfig(configFile string) (models.Config, error) {
+	var BackupConfig models.Config
 	_, err := os.Stat(configFile)
 	if err != nil {
 		return BackupConfig, err
@@ -49,45 +49,44 @@ func LoadConfig(configFile string) (*models.Config, error) {
 	return BackupConfig, err
 }
 
-func LoggerSetup(cfg *models.Config, llevel zerolog.Level) (*zerolog.Logger, error) {
+func LoggerSetup(cfg models.Config, llevel zerolog.Level) (*zerolog.Logger, error) {
 	var (
-		l zerolog.Logger
-		//writers []io.Writer
+		l   zerolog.Logger
 		err error
 	)
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	zerolog.SetGlobalLevel(llevel)
 
-	//logFileName := fmt.Sprintf("s3backup_%s%s", time.RFC3339, ".log")
 	logFileName := "s3backup.log"
-	//writers = append(writers, newRollingFile(cfg, logFileName))
-	if cfg.Logging.Console {
-		consoleWriter := zerolog.ConsoleWriter{Out: os.Stdout}
-		multi := zerolog.MultiLevelWriter(consoleWriter, os.Stdout)
-		l = zerolog.New(multi).With().Timestamp().Logger()
-	}
-	//mw := io.MultiWriter(writers...)
 
-	l = zerolog.New(&lumberjack.Logger{
+	lfile := zerolog.New(&lumberjack.Logger{
 		Filename:   path.Join(cfg.Logging.LogfileLocation, logFileName),
 		MaxBackups: cfg.Logging.MaxBackups, // files
 		MaxSize:    cfg.Logging.MaxSize,    // megabytes
 		MaxAge:     cfg.Logging.MaxAge,     // days
 	})
 
-	l = l.With().Caller().Timestamp().Logger()
+	if cfg.Logging.Console {
+		consoleWriter := zerolog.ConsoleWriter{Out: os.Stdout}
+		multi := zerolog.MultiLevelWriter(consoleWriter, lfile)
+		l = zerolog.New(multi).With().Timestamp().Logger()
+	} else {
+		l = zerolog.New(lfile).With().Caller().Timestamp().Logger()
+	}
 
 	return &l, err
 }
 
 func PrintHelp() {
 	fmt.Printf(`Program Usage:
-		-backup : 	Backs up the filesystems listed in config.json
+		-backup : 	Backs up the filesystems listed in config.json (default is false)
 		-config : 	Relative or full path to config file (requires a valid path e.g. '-config configs/config.json'
 		-sync 	: 	Reconciles s3 with local filesystem.  Any files not found on the local filesystem
-					will be removed from S3
-		-wipe 	: 	Wipes the entire S3 bucket from the config.json file
-		-force	:	Forces a wipe without asking for confirmation
+					will be removed from S3 (default is false)
+		-wipe 	: 	Wipes the entire S3 bucket from the config.json file (Default is false)
+		-force	:	Forces a wipe without asking for confirmation (Default is false)
+		-level  :   Which logging level - Info, Warn, Error, Debug (Default is Error)
+		-console :  If you would also like to log to console in addition to the logfile. Default is off (false)
 		`)
 
 }
