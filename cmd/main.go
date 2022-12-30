@@ -14,14 +14,14 @@ import (
 	"os"
 )
 
-//TODO: Fix console logging option
-//TODO: Add a way to clean
+//TODO: Write tests (centralized fakes for each package)
+//TODO: Clean up flag branching - hard to read
+//TODO: Write parallel option using wait groups and a goroutine for each directory structure given
+//TODO: Write README.md
 //TODO: Add a goroutine to continue checking for changed files and backing them up if they change
 //TODO: Restore option
-//TODO: Write tests (centralized fakes for each package)
 //TODO: Create RPM package for distribution
 //TODO: Create .deb package for distribution
-//TODO: Write README.md
 
 func main() {
 
@@ -102,7 +102,11 @@ func main() {
 				os.Exit(1)
 			}
 		}
-		bucketToWipe := s3clean.New(cfg, svc, l)
+		bucketToWipe := s3clean.New(
+			cfg,
+			svc,
+			l,
+		)
 		bucketToWipe.WipeS3Bucket()
 		l.Info().Msgf("Bucket %s has been wiped from S3!", cfg.AWS.S3Bucket)
 
@@ -132,8 +136,15 @@ func main() {
 
 	if *fsync {
 		if *fsync {
-			cleanBucket := s3clean.New(cfg, svc, l)
-			cleanBucket.SyncS3Bucket()
+			cleanBucket := s3clean.New(
+				cfg,
+				svc,
+				l,
+			)
+			err = cleanBucket.SyncS3Bucket()
+			if err != nil {
+				l.Error().Msgf("syncBucket failed on bucket %v with error %v", cfg.AWS.S3Bucket, err.Error())
+			}
 		}
 	} else {
 		l.Warn().Msg(WarnSyncNotSelected.Error())

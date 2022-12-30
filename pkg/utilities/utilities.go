@@ -88,5 +88,4 @@ func PrintHelp() {
 		-level  :   Which logging level - Info, Warn, Error, Debug (Default is Error)
 		-console :  If you would also like to log to console in addition to the logfile. Default is off (false)
 		`)
-
 }

@@ -13,9 +13,9 @@ import (
 	"os"
 )
 
-type S3Clean interface {
-	SyncS3Bucket()
-	WipeS3Bucket()
+type S3Cleaner interface {
+	SyncS3Bucket() (err error)
+	WipeS3Bucket() (err error)
 }
 
 type s3clean struct {
@@ -24,9 +24,12 @@ type s3clean struct {
 	l   *zerolog.Logger
 }
 
-// Constructor for cleaning up an S3 Bucket
-func New(cfg models.Config, svc s3iface.S3API, l *zerolog.Logger) s3clean {
-	return s3clean{
+func New(
+	cfg models.Config,
+	svc s3iface.S3API,
+	l *zerolog.Logger,
+) S3Cleaner {
+	return &s3clean{
 		cfg: cfg,
 		svc: svc,
 		l:   l,
@@ -35,7 +38,7 @@ func New(cfg models.Config, svc s3iface.S3API, l *zerolog.Logger) s3clean {
 
 // Wipes out the entire bucket.  This can be used by itself to empty a bucket
 // or before a backup if a clean start backup is required.
-func (s *s3clean) WipeS3Bucket() {
+func (s *s3clean) WipeS3Bucket() (err error) {
 	//svc := s3.New(&s.awsSess)
 	iter := s3manager.NewDeleteListIterator(s.svc, &s3.ListObjectsInput{
 		Bucket: &s.cfg.AWS.S3Bucket,
@@ -44,16 +47,17 @@ func (s *s3clean) WipeS3Bucket() {
 		s.l.Fatal().Err(err)
 		s.exitErrorf("Unable to delete objects from bucket %q, %v", s.cfg.AWS.S3Bucket, err)
 	}
+	return nil
 }
 
 // This method is intended to be run after a backup but can be run by itself.
 // It is used to remove any files in S3 which do not exist in the backup list provided in
 // the config file.
-func (s *s3clean) SyncS3Bucket() {
+func (s *s3clean) SyncS3Bucket() (err error) {
 
 	input := s.createInput()
 
-	result, done := s.getObjectList(input)
+	result, done := s.objectList(input)
 	if done {
 		return
 	}
@@ -61,17 +65,17 @@ func (s *s3clean) SyncS3Bucket() {
 	for i := range result.Contents {
 		s3file := *result.Contents[i].Key
 		osfile := "/" + *result.Contents[i].Key
-		_, err := os.Open(osfile)
+		_, err = os.Open(osfile)
 		if errors.Is(err, os.ErrNotExist) {
 			s.l.Info().Msgf("%s does not exist locally. Removing from S3", osfile)
-			s.deleteS3File(input, s3file)
+			err = s.deleteS3File(input, s3file)
 			if err != nil {
 				s.l.Warn().Msgf("%s not found in S3 ", s3file)
 			}
 		}
 	}
 
-	return
+	return nil
 }
 
 func (s *s3clean) deleteS3File(input *s3.ListObjectsV2Input, s3file string) error {
@@ -105,7 +109,7 @@ func (s *s3clean) createInput() *s3.ListObjectsV2Input {
 	return input
 }
 
-func (s *s3clean) getObjectList(input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, bool) {
+func (s *s3clean) objectList(input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, bool) {
 	result, err := s.svc.ListObjectsV2(input)
 	if err != nil {
 		if aerr, ok := err.(awserr.Error); ok {
