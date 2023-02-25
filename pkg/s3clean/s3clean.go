@@ -43,8 +43,8 @@ func (s *s3clean) WipeS3Bucket() (err error) {
 	iter := s3manager.NewDeleteListIterator(s.svc, &s3.ListObjectsInput{
 		Bucket: &s.cfg.AWS.S3Bucket,
 	})
-	if err := s3manager.NewBatchDeleteWithClient(s.svc).Delete(aws.BackgroundContext(), iter); err != nil {
-		s.l.Fatal().Err(err)
+	if err = s3manager.NewBatchDeleteWithClient(s.svc).Delete(aws.BackgroundContext(), iter); err != nil {
+		s.l.Error().Msgf("Unable to delete objects from bucket %q, %v", s.cfg.AWS.S3Bucket, err)
 		s.exitErrorf("Unable to delete objects from bucket %q, %v", s.cfg.AWS.S3Bucket, err)
 	}
 	return nil
@@ -67,10 +67,12 @@ func (s *s3clean) SyncS3Bucket() (err error) {
 		osfile := "/" + *result.Contents[i].Key
 		_, err = os.Open(osfile)
 		if errors.Is(err, os.ErrNotExist) {
-			s.l.Info().Msgf("%s does not exist locally. Removing from S3", osfile)
+			s.l.Info().Msgf("%s does not exist locally. Attempting to remove from S3", osfile)
 			err = s.deleteS3File(input, s3file)
 			if err != nil {
-				s.l.Warn().Msgf("%s not found in S3 ", s3file)
+				s.l.Warn().Msgf("UNABLE TO REMOVE: %s not found in S3. Continuing... ", s3file)
+			} else {
+				s.l.Info().Msgf("REMOVED FROM S3: %v", osfile)
 			}
 		}
 	}
