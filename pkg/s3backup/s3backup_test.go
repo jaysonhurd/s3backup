@@ -93,6 +93,7 @@ func TestBackupDirectory(t *testing.T) {
 
 	for _, cases := range tests {
 		t.Run(cases.name, func(t *testing.T) {
+
 			sess, err = utilities.CreateAWSSession(cfg, &l)
 			svc = s3.New(sess)
 			backup = s3backup.New(cfg, cases.mockSvc, cases.dir, &l)

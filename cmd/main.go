@@ -78,8 +78,6 @@ func main() {
 
 	if *fconsole {
 		cfg.Logging.Console = *fconsole
-	} else {
-		*fconsole = *fconsole
 	}
 
 	l, err := utilities.LoggerSetup(cfg, logLevel)
@@ -96,8 +94,11 @@ func main() {
 			fmt.Printf("You have selected the -wipe option. THIS WILL WIPE OUT ALL FILES IN YOUR BUCKET named %s in AWS Region %s!!  Do you wish to proceed?", cfg.AWS.S3Bucket, cfg.AWS.S3Region)
 			fmt.Printf("Do you wish to continue? [y/n]")
 			var answer string
-			fmt.Scanln(&answer)
-			if answer == "" || answer != "y" {
+			_, err = fmt.Scanln(&answer)
+			if err != nil {
+				log.Fatal().Err(err).Msg("Exiting program")
+			}
+			if answer != "y" {
 				l.Fatal().Msg(ErrInvalidWipeResponse.Error())
 				os.Exit(1)
 			}
@@ -107,7 +108,10 @@ func main() {
 			svc,
 			l,
 		)
-		bucketToWipe.WipeS3Bucket()
+		err = bucketToWipe.WipeS3Bucket()
+		if err != nil {
+			log.Fatal().Err(err).Msg("Exiting program")
+		}
 		l.Info().Msgf("Bucket %s has been wiped from S3!", cfg.AWS.S3Bucket)
 
 		if !*fbackup {
@@ -127,7 +131,7 @@ func main() {
 				cfg.AWS.BackupDirectories[i],
 				l,
 			)
-			backup.BackupDirectory()
+			err = backup.BackupDirectory()
 			if err != nil {
 				l.Fatal().Msg(ErrIssueWithBackupDir.Error())
 			}

@@ -54,25 +54,16 @@ func New(
 
 func (b *s3backup) SetConfig(cfg models.Config) (err error) {
 	b.cfg = cfg
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
 func (b *s3backup) SetAWSS3(svc s3iface.S3API) (err error) {
 	b.svc = svc
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
 func (b *s3backup) SetDirectory(dir string) (err error) {
 	b.dir = dir
-	if err != nil {
-		return err
-	}
 	return nil
 }
 
@@ -121,6 +112,7 @@ func (b *s3backup) BackupDirectory() (err error) {
 	return nil
 }
 
+// localFileTimestamp - gets the file timestamp of a given file on the local filesystem.
 func (b *s3backup) localFileTimestamp(file string) (time.Time, error) {
 	var filestat fs.FileInfo
 	filestat, err = os.Stat(file)
@@ -131,6 +123,7 @@ func (b *s3backup) localFileTimestamp(file string) (time.Time, error) {
 	return filestat.ModTime(), nil
 }
 
+// s3FileTimestamp - gets the file timestamp of a given file in S3
 func (b *s3backup) s3FileTimestamp(cfg models.Config, file string) (time.Time, error) {
 
 	var (
@@ -165,6 +158,7 @@ func (b *s3backup) s3FileTimestamp(cfg models.Config, file string) (time.Time, e
 	return *result.LastModified, nil
 }
 
+// s3FileTimestamp - Upload file to S3
 func (b *s3backup) uploadFileToS3(fileName string) error {
 
 	fileName, file, err = b.openFile(fileName)
@@ -178,7 +172,10 @@ func (b *s3backup) uploadFileToS3(fileName string) error {
 	fileInfo, _ := file.Stat()
 	//var size = fileInfo.Size()
 	buffer := make([]byte, fileInfo.Size())
-	file.Read(buffer)
+	_, err = file.Read(buffer)
+	if err != nil {
+		return err
+	}
 
 	_, err = b.svc.PutObject(&s3.PutObjectInput{
 		Bucket:               aws.String(b.cfg.AWS.S3Bucket),
