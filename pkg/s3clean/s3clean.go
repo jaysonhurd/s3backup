@@ -114,15 +114,14 @@ func (s *s3clean) createInput() *s3.ListObjectsV2Input {
 func (s *s3clean) objectList(input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, bool) {
 	result, err := s.svc.ListObjectsV2(input)
 	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok {
+		var aerr awserr.Error
+		if errors.As(err, &aerr) {
 			switch aerr.Code() {
 			case s3.ErrCodeNoSuchBucket:
 				s.l.Info().Msg(s3.ErrCodeNoSuchBucket)
 			default:
 				s.l.Info().Msg(aerr.Error())
 			}
-		} else {
-			s.l.Info().Msg(aerr.Error())
 		}
 		return nil, true
 	}
@@ -131,5 +130,6 @@ func (s *s3clean) objectList(input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Out
 
 func (s *s3clean) exitErrorf(msg string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, msg+"", args...)
+	s.l.Info().Str("stderr", os.Stderr.Name()).Interface("args", args).Msg(msg + "")
 	os.Exit(1)
 }

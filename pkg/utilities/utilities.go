@@ -9,7 +9,6 @@ import (
 	"github.com/jaysonhurd/s3backup/models"
 	"github.com/rs/zerolog"
 	"gopkg.in/natefinch/lumberjack.v2"
-	"io/ioutil"
 	"os"
 	"path"
 )
@@ -38,7 +37,7 @@ func LoadConfig(configFile string) (models.Config, error) {
 	if err != nil {
 		return BackupConfig, err
 	}
-	f, err := ioutil.ReadFile(configFile)
+	f, err := os.ReadFile(configFile)
 	if err != nil {
 		return BackupConfig, err
 	}
