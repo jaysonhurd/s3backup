@@ -1,34 +1,54 @@
 package utilities
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/jaysonhurd/s3backup/models"
-	"github.com/rs/zerolog"
-	"gopkg.in/natefinch/lumberjack.v2"
 	"os"
 	"path"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/jaysonhurd/s3backup/models"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-//go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 . Utilities
+const (
+	msgLoadAWSConfigFailed = "unable to load AWS configuration"
+	msgProgramUsageHelp    = `Program Usage:
+		-backup : 	Backs up the filesystems listed in config.json (default is false)
+		-config : 	Relative or full path to config file (requires a valid path e.g. '-config configs/config.json'
+		-sync 	: 	Reconciles s3 with local filesystem.  Any files not found on the local filesystem
+					will be removed from S3 (default is false)
+		-wipe 	: 	Wipes the entire S3 bucket from the config.json file (Default is false)
+		-force	:	Forces a wipe without asking for confirmation (Default is false)
+		-level  :   Which logging level - Info, Warn, Error, Debug (Default is Error)
+		-console :  If you would also like to log to console in addition to the logfile. Default is off (false)
+		`
+)
 
-func CreateAWSSession(cfg models.Config, l *zerolog.Logger) (*session.Session, error) {
-	s, err := session.NewSession(&aws.Config{
-		Region: aws.String(cfg.AWS.S3Region),
-		Credentials: credentials.NewStaticCredentials(
-			cfg.AWS.AccessKeyId,
-			cfg.AWS.SecretAccessKey,
-			""),
-	})
-
-	if err != nil {
-		l.Fatal().Err(err)
+func CreateAWSSession(cfg models.Config, l *zerolog.Logger) (aws.Config, error) {
+	loadOpts := []func(*config.LoadOptions) error{
+		config.WithRegion(cfg.AWS.S3Region),
 	}
 
-	return s, err
+	if cfg.AWS.AccessKeyId != "" && cfg.AWS.SecretAccessKey != "" {
+		loadOpts = append(loadOpts, config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(cfg.AWS.AccessKeyId, cfg.AWS.SecretAccessKey, ""),
+		))
+	}
+
+	awsCfg, err := config.LoadDefaultConfig(context.Background(), loadOpts...)
+	if err != nil {
+		if l != nil {
+			l.Error().Err(err).Msg(msgLoadAWSConfigFailed)
+		}
+		return aws.Config{}, err
+	}
+
+	return awsCfg, nil
 }
 
 func LoadConfig(configFile string) (models.Config, error) {
@@ -77,14 +97,5 @@ func LoggerSetup(cfg models.Config, llevel zerolog.Level) (*zerolog.Logger, erro
 }
 
 func PrintHelp() {
-	fmt.Printf(`Program Usage:
-		-backup : 	Backs up the filesystems listed in config.json (default is false)
-		-config : 	Relative or full path to config file (requires a valid path e.g. '-config configs/config.json'
-		-sync 	: 	Reconciles s3 with local filesystem.  Any files not found on the local filesystem
-					will be removed from S3 (default is false)
-		-wipe 	: 	Wipes the entire S3 bucket from the config.json file (Default is false)
-		-force	:	Forces a wipe without asking for confirmation (Default is false)
-		-level  :   Which logging level - Info, Warn, Error, Debug (Default is Error)
-		-console :  If you would also like to log to console in addition to the logfile. Default is off (false)
-		`)
+	log.Info().Msg(msgProgramUsageHelp)
 }
