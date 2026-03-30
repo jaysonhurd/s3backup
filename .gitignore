@@ -3,3 +3,4 @@ config.json
 go_build*
 ./idea*
 .idea*
+go.sum

@@ -42,3 +42,50 @@ Many of the above configs should be relatively straightforward.  A few caveats:
 rotator since this release of `S3Backup` does not rotate logs and they may grow to fill the disk.
 
 ## Usage
+
+Run the binary with flags to control backup, wipe, and sync behavior.
+
+```bash
+./s3backup [flags]
+```
+
+### Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `-config` | `string` | `/etc/config.json` | Path to the configuration file. |
+| `-backup` | `bool` | `false` | Run backup for directories listed in `AWS.BackupDirectories`. |
+| `-sync` | `bool` | `false` | Remove S3 objects that do not exist on local disk. |
+| `-wipe` | `bool` | `false` | Delete all objects in the configured S3 bucket. |
+| `-force` | `bool` | `false` | Skip confirmation prompt when `-wipe` is used. |
+| `-help` | `bool` | `false` | Print help/usage details. |
+| `-llevel` | `string` | `info` | Log level (`debug`, `info`, `warn`, `error`, `fatal`, `panic`). |
+| `-console` | `bool` | `false` | Enable console logging in addition to logfile output. |
+
+### Behavior Notes
+
+- `-wipe` without `-force` prompts for confirmation.
+- `-wipe` can be combined with `-backup` to do a clean-slate backup.
+- `-sync` is independent and can be used with or without `-backup`.
+- If neither `-backup` nor `-sync` is set, the app initializes and exits after setup checks.
+
+### Examples
+
+Backup using a custom config file:
+
+```bash
+./s3backup -config ./config/config.json -backup
+```
+
+Wipe bucket and then run a fresh backup:
+
+```bash
+./s3backup -config ./config/config.json -wipe -force -backup
+```
+
+Sync S3 with local filesystem and enable console logs:
+
+```bash
+./s3backup -config ./config/config.json -sync -console -llevel info
+```
+

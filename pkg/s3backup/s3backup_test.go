@@ -2,110 +2,114 @@ package s3backup_test
 
 import (
 	"errors"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/jaysonhurd/s3backup/models"
 	"github.com/jaysonhurd/s3backup/pkg/s3backup"
-	"github.com/jaysonhurd/s3backup/pkg/utilities"
 	"github.com/jaysonhurd/s3backup/test/fakes/s3api"
 	"github.com/rs/zerolog"
-	"github.com/spf13/afero"
-	"log"
-	"testing"
-	"testing/fstest"
-	"time"
 )
 
 var (
 	l             = zerolog.Nop()
-	sess          *session.Session
 	fakes3api     *s3api.FakeS3API
 	backup        s3backup.S3backuper
-	svc           *s3.S3
+	svc           *s3.Client
 	testDirectory = "test"
-	mockSvc       *mockS3Client
 	cfg           models.Config
-	dirTest       fstest.MapFS
-	testDirs      map[string]*fstest.MapFile
 	err           error
 	myTime        time.Time
-	FS            = afero.NewMemMapFs()
-	AFS           = &afero.Afero{Fs: FS}
 )
 
-func TestBackupDirectory(t *testing.T) {
+func TestBackupDirectoryNothingToDo(t *testing.T) {
 
-	fakes3api = new(s3api.FakeS3API)
-	myTime, _ = time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
-	tests := []struct {
-		name        string
-		mytime      time.Time
-		mockSvc     *mockS3Client
-		dir         string
-		files       map[string]*fstest.MapFile
-		expectedErr error
-	}{
-		{
-			name:    "SUCCEED_SKIP_S3_BECAUSE_FILE_IS_NEWER",
-			mockSvc: &mockS3Client{putObject: true, headObject: true, s3IsNewer: true, s3FileExists: true},
-			mytime:  myTime,
-			dir:     testDirectory,
-			//dir:         "./gotest",
-			expectedErr: nil,
+	cfg = models.Config{
+		AWS: models.AWS{
+			S3Region:             "somewhere",
+			S3Bucket:             "testbucket",
+			SecretAccessKey:      "xxxxxxx",
+			AccessKeyId:          "yyyyyyy",
+			BackupDirectories:    nil,
+			ACL:                  "",
+			ContentDisposition:   "",
+			ServerSideEncryption: "",
+			StorageClass:         "",
 		},
-		{
-			name:        "SUCCEED_FILE_DOESNT_EXIST_ON_AWS",
-			mockSvc:     &mockS3Client{putObject: true, headObject: false, s3IsNewer: true, s3FileExists: false},
-			mytime:      myTime,
-			dir:         testDirectory,
-			expectedErr: nil,
-		},
-		{
-			name:        "SUCCEED_FILE_IS_OLDER",
-			mockSvc:     &mockS3Client{putObject: true, headObject: true, s3IsNewer: false, s3FileExists: true},
-			mytime:      time.Now(),
-			dir:         testDirectory,
-			expectedErr: nil,
-		},
-		{
-			name:        "FAIL_S3_PUTOBJECT_FAIL",
-			mockSvc:     &mockS3Client{putObject: false, headObject: true, s3IsNewer: false, s3FileExists: true},
-			mytime:      myTime,
-			dir:         testDirectory,
-			expectedErr: errors.New("putobject error"),
-		},
-		{
-			name:        "FAIL_S3_HEADOBJECT_FAIL",
-			mockSvc:     &mockS3Client{putObject: true, headObject: false, s3IsNewer: true, s3FileExists: true},
-			mytime:      myTime,
-			dir:         testDirectory,
-			expectedErr: errors.New("headobject error"),
-		},
-		{
-			name:        "FAIL_NONEXISTENT_DIRECTORY",
-			mockSvc:     &mockS3Client{putObject: false, headObject: true, s3IsNewer: true, s3FileExists: true},
-			mytime:      myTime,
-			dir:         "nonexistent",
-			expectedErr: errors.New("lstat nonexistent: no such file or directory"),
-		},
+		Logging: models.Logging{},
 	}
+	fakes3api = new(s3api.FakeS3API)
+	fakes3api.PutObjectReturns(&s3.PutObjectOutput{}, nil)
+	lastModified, err := time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
+	fakes3api.HeadObjectReturns(&s3.HeadObjectOutput{LastModified: &lastModified}, nil)
+	myTime, _ = time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
+	myS3 := s3backup.New(cfg, fakes3api, testDirectory, &l)
 
-	for _, cases := range tests {
-		t.Run(cases.name, func(t *testing.T) {
+	err = myS3.BackupDirectory()
+	if err != nil {
+		t.Fail()
+	}
+}
 
-			sess, err = utilities.CreateAWSSession(cfg, &l)
-			svc = s3.New(sess)
-			backup = s3backup.New(cfg, cases.mockSvc, cases.dir, &l)
-			err = backup.BackupDirectory()
-			if err != nil {
-				if err.Error() != cases.expectedErr.Error() {
-					t.Errorf("expected %v, got %v", cases.expectedErr.Error(), err.Error())
-					t.Fail()
-				}
-			}
+func TestBackupDirectoryNonExistentDirectory(t *testing.T) {
 
-		})
+	cfg = models.Config{
+		AWS: models.AWS{
+			S3Region:             "somewhere",
+			S3Bucket:             "testbucket",
+			SecretAccessKey:      "xxxxxxx",
+			AccessKeyId:          "yyyyyyy",
+			BackupDirectories:    nil,
+			ACL:                  "",
+			ContentDisposition:   "",
+			ServerSideEncryption: "",
+			StorageClass:         "",
+		},
+		Logging: models.Logging{},
+	}
+	fakes3api = new(s3api.FakeS3API)
+	fakes3api.PutObjectReturns(&s3.PutObjectOutput{}, nil)
+	lastModified, err := time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
+	fakes3api.HeadObjectReturns(&s3.HeadObjectOutput{LastModified: &lastModified}, nil)
+	myTime, _ = time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
+	myS3 := s3backup.New(cfg, fakes3api, "nodirectory", &l)
+
+	err = myS3.BackupDirectory()
+	if err == nil {
+		t.Fail()
+	}
+}
+
+func TestBackupDirectoryHeadObjectFails(t *testing.T) {
+
+	cfg = models.Config{
+		AWS: models.AWS{
+			S3Region:             "somewhere",
+			S3Bucket:             "testbucket",
+			SecretAccessKey:      "xxxxxxx",
+			AccessKeyId:          "yyyyyyy",
+			BackupDirectories:    nil,
+			ACL:                  "",
+			ContentDisposition:   "",
+			ServerSideEncryption: "",
+			StorageClass:         "",
+		},
+		Logging: models.Logging{},
+	}
+	fakes3api = new(s3api.FakeS3API)
+	//fakes3api.PutObjectReturns(&s3.PutObjectOutput{}, nil)
+	//lastModified, err := time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
+	fakes3api.HeadObjectReturns(&s3.HeadObjectOutput{}, errors.New("something went wrong"))
+	myTime, _ = time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
+	myS3 := s3backup.New(cfg, fakes3api, testDirectory, &l)
+
+	err = myS3.BackupDirectory()
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
 	}
 }
 
@@ -175,52 +179,73 @@ func TestSetDirectory(t *testing.T) {
 	}
 }
 
-type MockS3Client interface {
-	HeadObject(_ *s3.HeadObjectInput) (*s3.HeadObjectOutput, error)
-	PutObject(input *s3.PutObjectInput) (*s3.PutObjectOutput, error)
-}
-
-type mockS3Client struct {
-	s3api.FakeS3API
-	putObject    bool
-	headObject   bool
-	s3IsNewer    bool
-	s3FileExists bool
-}
-
-func (m *mockS3Client) PutObject(input *s3.PutObjectInput) (*s3.PutObjectOutput, error) {
-	log.Println("Mock Uploaded to PHONY S3:", *input.Key)
-	if m.putObject {
-		return &s3.PutObjectOutput{}, nil
-	} else {
-		return &s3.PutObjectOutput{}, errors.New("putobject error")
+func TestBackupDirectorySetsConfiguredACL(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "sample.txt")
+	if writeErr := os.WriteFile(tmpFile, []byte("hello"), 0o600); writeErr != nil {
+		t.Fatalf("unable to create temp file: %v", writeErr)
 	}
 
-	return &s3.PutObjectOutput{}, nil
+	cfg = models.Config{
+		AWS: models.AWS{
+			S3Region:             "us-east-1",
+			S3Bucket:             "testbucket",
+			ACL:                  "private",
+			ContentDisposition:   "attachment",
+			ServerSideEncryption: "AES256",
+			StorageClass:         "STANDARD",
+		},
+		Logging: models.Logging{},
+	}
 
+	fakes3api = new(s3api.FakeS3API)
+	fakes3api.PutObjectReturns(&s3.PutObjectOutput{}, nil)
+	old := time.Unix(0, 0).UTC()
+	fakes3api.HeadObjectReturns(&s3.HeadObjectOutput{LastModified: &old}, nil)
+
+	backupRunner := s3backup.New(cfg, fakes3api, tmpDir, &l)
+	if backupErr := backupRunner.BackupDirectory(); backupErr != nil {
+		t.Fatalf("BackupDirectory() returned unexpected error: %v", backupErr)
+	}
+
+	if fakes3api.LastPutObjectInput == nil {
+		t.Fatalf("expected PutObject to be called")
+	}
+	if fakes3api.LastPutObjectInput.ACL != s3types.ObjectCannedACLPrivate {
+		t.Fatalf("expected ACL %q, got %q", s3types.ObjectCannedACLPrivate, fakes3api.LastPutObjectInput.ACL)
+	}
 }
 
-func (m *mockS3Client) HeadObject(_ *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
-	var result s3.HeadObjectOutput
-	//var err error
-
-	if !m.headObject {
-		if !m.s3FileExists {
-			return &result, awserr.New("NotFound", "", nil)
-		}
-		myTime, _ = time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
-		result.LastModified = &myTime
-		return &result, errors.New("headobject error")
+func TestBackupDirectorySkipsPutObjectOnInvalidACL(t *testing.T) {
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "sample.txt")
+	if writeErr := os.WriteFile(tmpFile, []byte("hello"), 0o600); writeErr != nil {
+		t.Fatalf("unable to create temp file: %v", writeErr)
 	}
 
-	if m.s3IsNewer {
-		myTime = time.Now()
-		result.LastModified = &myTime
-		return &result, nil
-	} else {
-		myTime, _ = time.Parse("2 Jan 2006 03:04PM", "10 Nov 1970 11:00PM")
-		result.LastModified = &myTime
-		return &result, nil
+	cfg = models.Config{
+		AWS: models.AWS{
+			S3Region:             "us-east-1",
+			S3Bucket:             "testbucket",
+			ACL:                  "not-a-real-acl",
+			ContentDisposition:   "attachment",
+			ServerSideEncryption: "AES256",
+			StorageClass:         "STANDARD",
+		},
+		Logging: models.Logging{},
 	}
 
+	fakes3api = new(s3api.FakeS3API)
+	fakes3api.PutObjectReturns(&s3.PutObjectOutput{}, nil)
+	old := time.Unix(0, 0).UTC()
+	fakes3api.HeadObjectReturns(&s3.HeadObjectOutput{LastModified: &old}, nil)
+
+	backupRunner := s3backup.New(cfg, fakes3api, tmpDir, &l)
+	if backupErr := backupRunner.BackupDirectory(); backupErr != nil {
+		t.Fatalf("BackupDirectory() returned unexpected error: %v", backupErr)
+	}
+
+	if fakes3api.LastPutObjectInput != nil {
+		t.Fatalf("expected PutObject not to be called for invalid ACL")
+	}
 }

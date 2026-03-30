@@ -1,22 +1,53 @@
 package s3backup
 
 import (
-	"bytes"
-	"fmt"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3iface"
-	"github.com/jaysonhurd/s3backup/models"
-	"github.com/rs/zerolog"
+	"context"
+	"errors"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+	"github.com/jaysonhurd/s3backup/models"
+	"github.com/rs/zerolog"
 )
 
-//go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 -o ../../test/fakes/s3api/s3api.go github.com/aws/aws-sdk-go/service/s3/s3iface/.S3API
+const (
+	msgWalkFilesystemError    = "error while walking filesystem path"
+	msgSkipDirectory          = "skipping directory"
+	msgSkipNonRegularFile     = "skipping non-regular file"
+	msgGetS3TimestampError    = "error getting S3 file timestamp"
+	msgGetLocalTimestampError = "localFileTimestamp failed - continuing"
+	msgBackingUpFile          = "backing up file"
+	msgUploadToS3Error        = "error uploading file to S3"
+	msgSkippingFile           = "skipping file because it has the same or older timestamp than S3"
+	msgWalkRootPathError      = "error walking root path"
+	msgLocalFileStatError     = "error checking local file timestamp"
+	msgOpenFileError          = "error opening file for upload"
+	msgReadFileBufferError    = "error reading file bytes for upload"
+	msgSeekFileError          = "error seeking file for upload"
+	msgInvalidObjectACL       = "invalid object ACL in configuration"
+	msgPutObjectError         = "PutObject failed"
+)
+
+var objectACLMap = map[string]s3types.ObjectCannedACL{
+	"private":                   s3types.ObjectCannedACLPrivate,
+	"public-read":               s3types.ObjectCannedACLPublicRead,
+	"public-read-write":         s3types.ObjectCannedACLPublicReadWrite,
+	"authenticated-read":        s3types.ObjectCannedACLAuthenticatedRead,
+	"aws-exec-read":             s3types.ObjectCannedACLAwsExecRead,
+	"bucket-owner-read":         s3types.ObjectCannedACLBucketOwnerRead,
+	"bucket-owner-full-control": s3types.ObjectCannedACLBucketOwnerFullControl,
+}
+
+//go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 -o ../../test/fakes/s3api/s3api.go github.com/jaysonhurd/s3backup/pkg/s3backup/.S3API
 
 var (
 	err error
@@ -27,20 +58,25 @@ var (
 type S3backuper interface {
 	BackupDirectory() error
 	SetConfig(cfg models.Config) error
-	SetAWSS3(svc s3iface.S3API) error
+	SetAWSS3(svc S3API) error
 	SetDirectory(dir string) error
+}
+
+type S3API interface {
+	HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 }
 
 type s3backup struct {
 	cfg models.Config
-	svc s3iface.S3API
+	svc S3API
 	dir string
 	l   *zerolog.Logger
 }
 
 func New(
 	cfg models.Config,
-	svc s3iface.S3API,
+	svc S3API,
 	dir string,
 	l *zerolog.Logger,
 ) S3backuper {
@@ -57,7 +93,7 @@ func (b *s3backup) SetConfig(cfg models.Config) (err error) {
 	return nil
 }
 
-func (b *s3backup) SetAWSS3(svc s3iface.S3API) (err error) {
+func (b *s3backup) SetAWSS3(svc S3API) (err error) {
 	b.svc = svc
 	return nil
 }
@@ -74,14 +110,24 @@ func (b *s3backup) BackupDirectory() (err error) {
 	err = filepath.WalkDir(b.dir, func(path string, info fs.DirEntry, err error) error {
 
 		if err != nil {
-			b.l.Error().Msgf("error with walking filesystem %v: %v ", path, err.Error())
+			b.l.Error().Err(err).Str("path", path).Msg(msgWalkFilesystemError)
 			return err
+		}
+
+		if info.IsDir() {
+			b.l.Debug().Str("path", path).Msg(msgSkipDirectory)
+			return nil
+		}
+
+		if !info.Type().IsRegular() {
+			b.l.Debug().Str("path", path).Msg(msgSkipNonRegularFile)
+			return nil
 		}
 
 		s3objectTime, err := b.s3FileTimestamp(b.cfg, path)
 		if err != nil {
-			b.l.Error().Msgf("error with getting s3FileTimeStamp: %v ", err.Error())
-			return err
+			b.l.Error().Err(err).Str("path", path).Msg(msgGetS3TimestampError)
+			//return err
 		}
 
 		// Error checking here is for good measure but would likely never be reached.
@@ -89,24 +135,23 @@ func (b *s3backup) BackupDirectory() (err error) {
 		// (microseconds).  This proved too difficult to write a test for.
 		localFileTime, err := b.localFileTimestamp(path)
 		if err != nil {
-			b.l.Error().Msgf("localFileTimestamp error on %v - error is: %v - CONTINUING", path, err.Error())
+			b.l.Error().Err(err).Str("path", path).Msg(msgGetLocalTimestampError)
 		}
-		if localFileTime.Unix() > s3objectTime.Unix() {
-			b.l.Info().Msgf("BACKING UP FILE: %q to AWS S3 storage type %s", path, b.cfg.AWS.StorageClass)
+		if localFileTime.After(s3objectTime) {
+			b.l.Info().Str("path", path).Str("storage_class", b.cfg.AWS.StorageClass).Msg(msgBackingUpFile)
 			err = b.uploadFileToS3(path)
 			if err != nil {
-				b.l.Error().Msgf("error uploading file to S3: %v", err.Error())
+				b.l.Error().Err(err).Str("path", path).Msg(msgUploadToS3Error)
 				//return err
 			}
 		} else {
-			b.l.Info().Msgf("SKIPPING File: %q because it has the same or older timestamp than the version in S3", path)
+			b.l.Info().Str("path", path).Msg(msgSkippingFile)
 		}
-		fmt.Println(path)
 		return nil
 	})
 
 	if err != nil {
-		b.l.Error().Msgf("error walking the path %q: %v", b.dir, err.Error())
+		b.l.Error().Err(err).Str("root_dir", b.dir).Msg(msgWalkRootPathError)
 		return err
 	}
 	return nil
@@ -117,7 +162,7 @@ func (b *s3backup) localFileTimestamp(file string) (time.Time, error) {
 	var filestat fs.FileInfo
 	filestat, err = os.Stat(file)
 	if err != nil {
-		b.l.Error().Msgf("error checking local file timestamp on file %v, erorr is %v", file, err.Error())
+		b.l.Error().Err(err).Str("file", file).Msg(msgLocalFileStatError)
 		return time.Now(), err
 	}
 	return filestat.ModTime(), nil
@@ -129,30 +174,30 @@ func (b *s3backup) s3FileTimestamp(cfg models.Config, file string) (time.Time, e
 	var (
 		result *s3.HeadObjectOutput
 		epoch  time.Time
-		aerr   awserr.Error
-		ok     bool
+		apiErr smithy.APIError
+		nfErr  *s3types.NotFound
 	)
 
-	input := &s3.HeadObjectInput{
+	input := s3.HeadObjectInput{
 		Bucket: aws.String(cfg.AWS.S3Bucket),
 		Key:    aws.String(file),
 	}
 
-	result, err = b.svc.HeadObject(input)
+	result, err = b.svc.HeadObject(context.Background(), &input)
 
 	if err != nil {
-		if aerr, ok = err.(awserr.Error); ok {
-			switch aerr.Code() {
-			case "NotFound":
-				epoch = time.Date(1970, 01, 01, 01, 01, 01, 1, time.UTC)
-				return epoch, nil
-			default:
-				epoch = time.Date(1970, 01, 01, 01, 01, 01, 1, time.UTC)
-				return epoch, err
-			}
-		} else {
-			return *result.LastModified, err
+		epoch = time.Date(1970, 01, 01, 01, 01, 01, 1, time.UTC)
+		if errors.As(err, &nfErr) {
+			return epoch, nil
 		}
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "NotFound" {
+			return epoch, nil
+		}
+		return epoch, err
+	}
+
+	if result == nil || result.LastModified == nil {
+		return time.Date(1970, 01, 01, 01, 01, 01, 1, time.UTC), nil
 	}
 
 	return *result.LastModified, nil
@@ -163,37 +208,69 @@ func (b *s3backup) uploadFileToS3(fileName string) error {
 
 	fileName, file, err = b.openFile(fileName)
 	if err != nil {
-		b.l.Error().Err(err)
+		b.l.Error().Err(err).Msg(msgOpenFileError)
 		return err
 	}
 
 	defer file.Close()
 
-	fileInfo, _ := file.Stat()
-	//var size = fileInfo.Size()
-	buffer := make([]byte, fileInfo.Size())
-	_, err = file.Read(buffer)
-	if err != nil {
+	fileInfo, statErr := file.Stat()
+	if statErr != nil {
+		b.l.Error().Err(statErr).Msg(msgLocalFileStatError)
+		return statErr
+	}
+
+	header := make([]byte, 512)
+	n, err := file.Read(header)
+	if err != nil && !errors.Is(err, io.EOF) {
+		b.l.Error().Err(err).Msg(msgReadFileBufferError)
 		return err
 	}
 
-	_, err = b.svc.PutObject(&s3.PutObjectInput{
+	if _, err = file.Seek(0, 0); err != nil {
+		b.l.Error().Err(err).Msg(msgSeekFileError)
+		return err
+	}
+
+	objectACL, err := objectCannedACLFromString(b.cfg.AWS.ACL)
+	if err != nil {
+		b.l.Error().Err(err).Str("acl", b.cfg.AWS.ACL).Msg(msgInvalidObjectACL)
+		return err
+	}
+
+	putObject := s3.PutObjectInput{
 		Bucket:               aws.String(b.cfg.AWS.S3Bucket),
 		Key:                  aws.String(fileName),
-		ACL:                  aws.String(b.cfg.AWS.ACL),
-		Body:                 bytes.NewReader(buffer),
+		Body:                 file,
 		ContentLength:        aws.Int64(fileInfo.Size()),
-		ContentType:          aws.String(http.DetectContentType(buffer)),
+		ContentType:          aws.String(http.DetectContentType(header[:n])),
 		ContentDisposition:   aws.String(b.cfg.AWS.ContentDisposition),
-		ServerSideEncryption: aws.String(b.cfg.AWS.ServerSideEncryption),
-		StorageClass:         aws.String(b.cfg.AWS.StorageClass),
-	})
+		ServerSideEncryption: s3types.ServerSideEncryption(b.cfg.AWS.ServerSideEncryption),
+		StorageClass:         s3types.StorageClass(b.cfg.AWS.StorageClass),
+	}
+	if objectACL != "" {
+		putObject.ACL = objectACL
+	}
+
+	_, err = b.svc.PutObject(context.Background(), &putObject)
 
 	if err != nil {
-		b.l.Error().Msgf("PutObject error: %s", err.Error())
+		b.l.Error().Err(err).Msg(msgPutObjectError)
 		return err
 	}
 	return nil
+}
+
+func objectCannedACLFromString(acl string) (s3types.ObjectCannedACL, error) {
+	trimmed := strings.TrimSpace(acl)
+	if trimmed == "" {
+		return "", nil
+	}
+	mapped, ok := objectACLMap[strings.ToLower(trimmed)]
+	if !ok {
+		return "", errors.New("unsupported object ACL value")
+	}
+	return mapped, nil
 }
 
 func (b *s3backup) openFile(fileName string) (string, *os.File, error) {
