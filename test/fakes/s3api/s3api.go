@@ -11,6 +11,7 @@ type FakeS3API struct {
 	headObjectErr      error
 	putObjectOutput    *s3.PutObjectOutput
 	putObjectErr       error
+	LastPutObjectInput *s3.PutObjectInput
 	listObjectsOutput  *s3.ListObjectsV2Output
 	listObjectsErr     error
 	deleteObjectOutput *s3.DeleteObjectOutput
@@ -45,7 +46,8 @@ func (f *FakeS3API) HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3
 	}
 	return f.headObjectOutput, f.headObjectErr
 }
-func (f *FakeS3API) PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+func (f *FakeS3API) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	f.LastPutObjectInput = in
 	if f.putObjectOutput == nil {
 		f.putObjectOutput = &s3.PutObjectOutput{}
 	}

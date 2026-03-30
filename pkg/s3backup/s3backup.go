@@ -1,13 +1,14 @@
 package s3backup
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -20,6 +21,8 @@ import (
 
 const (
 	msgWalkFilesystemError    = "error while walking filesystem path"
+	msgSkipDirectory          = "skipping directory"
+	msgSkipNonRegularFile     = "skipping non-regular file"
 	msgGetS3TimestampError    = "error getting S3 file timestamp"
 	msgGetLocalTimestampError = "localFileTimestamp failed - continuing"
 	msgBackingUpFile          = "backing up file"
@@ -29,8 +32,20 @@ const (
 	msgLocalFileStatError     = "error checking local file timestamp"
 	msgOpenFileError          = "error opening file for upload"
 	msgReadFileBufferError    = "error reading file bytes for upload"
+	msgSeekFileError          = "error seeking file for upload"
+	msgInvalidObjectACL       = "invalid object ACL in configuration"
 	msgPutObjectError         = "PutObject failed"
 )
+
+var objectACLMap = map[string]s3types.ObjectCannedACL{
+	"private":                   s3types.ObjectCannedACLPrivate,
+	"public-read":               s3types.ObjectCannedACLPublicRead,
+	"public-read-write":         s3types.ObjectCannedACLPublicReadWrite,
+	"authenticated-read":        s3types.ObjectCannedACLAuthenticatedRead,
+	"aws-exec-read":             s3types.ObjectCannedACLAwsExecRead,
+	"bucket-owner-read":         s3types.ObjectCannedACLBucketOwnerRead,
+	"bucket-owner-full-control": s3types.ObjectCannedACLBucketOwnerFullControl,
+}
 
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 -o ../../test/fakes/s3api/s3api.go github.com/jaysonhurd/s3backup/pkg/s3backup/.S3API
 
@@ -97,6 +112,16 @@ func (b *s3backup) BackupDirectory() (err error) {
 		if err != nil {
 			b.l.Error().Err(err).Str("path", path).Msg(msgWalkFilesystemError)
 			return err
+		}
+
+		if info.IsDir() {
+			b.l.Debug().Str("path", path).Msg(msgSkipDirectory)
+			return nil
+		}
+
+		if !info.Type().IsRegular() {
+			b.l.Debug().Str("path", path).Msg(msgSkipNonRegularFile)
+			return nil
 		}
 
 		s3objectTime, err := b.s3FileTimestamp(b.cfg, path)
@@ -189,24 +214,42 @@ func (b *s3backup) uploadFileToS3(fileName string) error {
 
 	defer file.Close()
 
-	fileInfo, _ := file.Stat()
-	//var size = fileInfo.Size()
-	buffer := make([]byte, fileInfo.Size())
-	_, err = file.Read(buffer)
-	if err != nil {
+	fileInfo, statErr := file.Stat()
+	if statErr != nil {
+		b.l.Error().Err(statErr).Msg(msgLocalFileStatError)
+		return statErr
+	}
+
+	header := make([]byte, 512)
+	n, err := file.Read(header)
+	if err != nil && !errors.Is(err, io.EOF) {
 		b.l.Error().Err(err).Msg(msgReadFileBufferError)
+		return err
+	}
+
+	if _, err = file.Seek(0, 0); err != nil {
+		b.l.Error().Err(err).Msg(msgSeekFileError)
+		return err
+	}
+
+	objectACL, err := objectCannedACLFromString(b.cfg.AWS.ACL)
+	if err != nil {
+		b.l.Error().Err(err).Str("acl", b.cfg.AWS.ACL).Msg(msgInvalidObjectACL)
 		return err
 	}
 
 	putObject := s3.PutObjectInput{
 		Bucket:               aws.String(b.cfg.AWS.S3Bucket),
 		Key:                  aws.String(fileName),
-		Body:                 bytes.NewReader(buffer),
+		Body:                 file,
 		ContentLength:        aws.Int64(fileInfo.Size()),
-		ContentType:          aws.String(http.DetectContentType(buffer)),
+		ContentType:          aws.String(http.DetectContentType(header[:n])),
 		ContentDisposition:   aws.String(b.cfg.AWS.ContentDisposition),
 		ServerSideEncryption: s3types.ServerSideEncryption(b.cfg.AWS.ServerSideEncryption),
 		StorageClass:         s3types.StorageClass(b.cfg.AWS.StorageClass),
+	}
+	if objectACL != "" {
+		putObject.ACL = objectACL
 	}
 
 	_, err = b.svc.PutObject(context.Background(), &putObject)
@@ -216,6 +259,18 @@ func (b *s3backup) uploadFileToS3(fileName string) error {
 		return err
 	}
 	return nil
+}
+
+func objectCannedACLFromString(acl string) (s3types.ObjectCannedACL, error) {
+	trimmed := strings.TrimSpace(acl)
+	if trimmed == "" {
+		return "", nil
+	}
+	mapped, ok := objectACLMap[strings.ToLower(trimmed)]
+	if !ok {
+		return "", errors.New("unsupported object ACL value")
+	}
+	return mapped, nil
 }
 
 func (b *s3backup) openFile(fileName string) (string, *os.File, error) {
