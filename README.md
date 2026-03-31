@@ -2,8 +2,29 @@
 
 ## Summary
 This program will synchronize one or more of Linux directory structures with Amazon S3 storage.  It is designed to leverage
-low cost AWS storage.  Currently this build only supports backing up `rpm` based installations (i.e. Fedora, Redhat, 
-CentOS etc.).  Feel free to pull down the source code and compile on another Linux flavor in hopes it may work.
+low cost AWS storage.
+
+You can either download a pre-built executable from the [Releases](https://github.com/jaysonhurd/s3backup/releases) page for your platform, or pull down the source code and compile it yourself.
+
+> ⚠️ **Note:** This tool has been tested on Fedora. While it may work on other operating systems, testing on other platforms is limited. Please test thoroughly in your environment before using in production.
+
+## Installation
+
+### Download Pre-built Executables
+
+Pre-built executables for multiple platforms are available on the [Releases](https://github.com/jaysonhurd/s3backup/releases) page.
+
+**Available builds:**
+- Linux: `s3backup-linux-amd64`, `s3backup-linux-arm64`
+- macOS: `s3backup-darwin-amd64` (Intel), `s3backup-darwin-arm64` (Apple Silicon)
+- Windows: `s3backup-windows-amd64.exe`, `s3backup-windows-arm64.exe`
+
+Each release includes SHA256 checksums for verification:
+
+```bash
+# Verify download integrity
+sha256sum -c s3backup-linux-amd64.sha256
+```
 
 ## Setup
 First you need to populate the `config/config.json` file with the approprate configurations.  Some of these you will 
@@ -43,11 +64,19 @@ rotator since this release of `S3Backup` does not rotate logs and they may grow 
 
 ## Usage
 
-Run the binary with flags to control backup, wipe, and sync behavior.
+### Running with Config File
+
+After downloading the binary for your platform and preparing your config file, run the binary with the `-config` flag to specify the path to your configuration:
 
 ```bash
-./s3backup [flags]
+# Make it executable (Linux/macOS only)
+chmod +x s3backup-linux-amd64
+
+# Run with config file
+./s3backup-linux-amd64 -config ./config.json -backup
 ```
+
+The binary accepts various flags to control backup, wipe, and sync behavior:
 
 ### Flags
 
