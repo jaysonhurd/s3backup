@@ -15,6 +15,9 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// version is set at build time via -ldflags "-X main.version=<tag>".
+var version = "dev"
+
 const (
 	msgInvalidLoggerLevel    = "Invalid logger format! Options are: info, warn, error, fatal"
 	msgLoadConfigFailed      = "Failed to load config file"

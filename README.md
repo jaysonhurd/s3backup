@@ -2,8 +2,72 @@
 
 ## Summary
 This program will synchronize one or more of Linux directory structures with Amazon S3 storage.  It is designed to leverage
-low cost AWS storage.  Currently this build only supports backing up `rpm` based installations (i.e. Fedora, Redhat, 
-CentOS etc.).  Feel free to pull down the source code and compile on another Linux flavor in hopes it may work.
+low cost AWS storage. It is Go-based and can run on common Linux distributions including Ubuntu, Fedora, and Red Hat Enterprise Linux.
+
+## Releases
+
+Pre-built binaries for all major platforms are published automatically to [GitHub Releases](../../releases) whenever a version tag is pushed.
+
+### Supported platforms
+
+| Platform | Architecture | File |
+|---|---|---|
+| Linux | amd64 | `s3backup-linux-amd64` |
+| Linux | arm64 | `s3backup-linux-arm64` |
+| macOS | amd64 (Intel) | `s3backup-darwin-amd64` |
+| macOS | arm64 (Apple Silicon) | `s3backup-darwin-arm64` |
+| Windows | amd64 | `s3backup-windows-amd64.exe` |
+| Windows | arm64 | `s3backup-windows-arm64.exe` |
+
+### Download and run (Linux example)
+
+```bash
+# Download the binary
+curl -LO https://github.com/jaysonhurd/s3backup/releases/latest/download/s3backup-linux-amd64
+
+# (Optional) verify the checksum
+curl -LO https://github.com/jaysonhurd/s3backup/releases/latest/download/s3backup-linux-amd64.sha256
+sha256sum -c s3backup-linux-amd64.sha256
+
+# Make executable and run
+chmod +x s3backup-linux-amd64
+./s3backup-linux-amd64 -config ./config/config.json -backup
+```
+
+### Creating a new release
+
+Tag a commit and push the tag — the workflow does the rest:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Pre-release tags (`-alpha`, `-beta`, `-rc`) are automatically marked as pre-releases on GitHub.
+
+---
+
+## Linux Compatibility
+
+This project is distro-agnostic at runtime. Build a static Linux binary and use the same executable on Ubuntu and Fedora/RHEL.
+
+### Build (portable Linux binary)
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/s3backup-linux-amd64 ./cmd
+```
+
+### Run
+
+```bash
+./bin/s3backup-linux-amd64 -config ./config/config.json -backup
+```
+
+### Optional: install to a standard path
+
+```bash
+sudo install -m 0755 ./bin/s3backup-linux-amd64 /usr/local/bin/s3backup
+```
 
 ## Setup
 First you need to populate the `config/config.json` file with the approprate configurations.  Some of these you will 
