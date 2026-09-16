@@ -1,0 +1,33 @@
+name: CI
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ''
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check formatting and module consistency
+        run: |
+          test -z "$(gofmt -l cmd models pkg test)"
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          go mod verify
+      - run: go vet ./...
+      - run: go test -race -cover ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...

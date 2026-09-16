@@ -1,120 +1,85 @@
-# S3Backup
+# s3backup
 
-## Summary
-This program will synchronize one or more of Linux directory structures with Amazon S3 storage.  It is designed to leverage
-low cost AWS storage.
+Back up regular files to an Amazon S3 general-purpose bucket. Optionally remove remote files that are missing locally, or wipe all current objects in the bucket.
 
-You can either download a pre-built executable from the [Releases](https://github.com/jaysonhurd/s3backup/releases) page for your platform, or pull down the source code and compile it yourself.
+## Build and test
 
-> ⚠️ **Note:** This tool has been tested on Fedora. While it may work on other operating systems, testing on other platforms is limited. Please test thoroughly in your environment before using in production.
+Requires **Go 1.27.1 or later**.
 
-## Installation
-
-### Download Pre-built Executables
-
-Pre-built executables for multiple platforms are available on the [Releases](https://github.com/jaysonhurd/s3backup/releases) page.
-
-**Available builds:**
-- Linux: `s3backup-linux-amd64`, `s3backup-linux-arm64`
-- macOS: `s3backup-darwin-amd64` (Intel), `s3backup-darwin-arm64` (Apple Silicon)
-- Windows: `s3backup-windows-amd64.exe`, `s3backup-windows-arm64.exe`
-
-Each release includes SHA256 checksums for verification:
-
-```bash
-# Verify download integrity
-sha256sum -c s3backup-linux-amd64.sha256
+```sh
+go build -o s3backup ./cmd
+go test -race ./...
+go vet ./...
 ```
 
-## Setup
-First you need to populate the `config/config.json` file with the approprate configurations.  Some of these you will 
-need to first create from within your AWS account:
+Release builds include Linux, macOS, and Windows binaries for amd64 and arm64. Use `s3backup -version` to check the build tag. Download binaries and matching `.sha256` files from this repository's Releases page; verify with `sha256sum -c <binary>.sha256` on Linux.
 
-```azure
-{
-  "AWS": {
-    "S3Region": "us-east-2",
-    "S3Bucket": "BUCKET_OF_CHOICE",
-    "AccessKeyId": "AWS_ACCESS_KEY_ID",
-    "SecretAccessKey": "AWSX_SECRET_ACCESS_KEY",
-    "BackupDirectories": [
-      "/home/user/directory1",
-      "/home/user/directory2",
-      "/home/user/directory3",
-      "/home/user/directory4"
-     ],
-    "ACL": "private",
-    "ContentDisposition": "attachment",
-    "ServerSideEncryption": "AES256",
-    "StorageClass": "GLACIER"
-  },
-  "logging": {
-    "logfile_location": "/home/user/backups.log",
-    "max_backups": 4,
-    "max_size": 1,
-    "max_age": 1
-  }
-}
-```
-Many of the above configs should be relatively straightforward.  A few caveats: 
-- `StorageClass`: Storage classes for AWS S3 can be found [here](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html).  The default in the config file is 
-`GLACIER`.
-- `logfile_location`: Make sure to put your logfile in a valid location.  Also be sure to build some sort of logfile
-rotator since this release of `S3Backup` does not rotate logs and they may grow to fill the disk.
+## Configuration
+
+Copy [config/config.json.tmpl](config/config.json.tmpl), then set your bucket, region, source directories, and log directory. The configuration must contain nested `AWS` and `Logging` objects. Unknown fields, incomplete credentials, and invalid options produce an error before S3 operations begin.
+
+Use the standard AWS credential chain: environment variables, shared AWS profiles/SSO, or workload IAM roles. `AWS_PROFILE` selects a profile. Region can come from `AWS.S3Region` or the SDK's environment/shared configuration. Credentials are not needed for `-help` or `-version`.
+
+Static `AWS.AccessKeyId` and `AWS.SecretAccessKey` remain supported together. Temporary static credentials also require `AWS.SessionToken`. Prefer temporary credentials; do not commit secrets.
+
+Optional upload settings:
+
+- `ACL`: omitted by default, compatible with buckets that disable ACLs. Explicit `private` ACLs fail on bucket-owner-enforced buckets; use no ACL or `bucket-owner-full-control` where appropriate.
+- `StorageClass`: defaults to S3's standard storage behavior when omitted. The template uses `STANDARD`.
+- `ServerSideEncryption`: `AES256`, `aws:kms`, or another supported S3 value. Omission uses bucket encryption defaults. Set `SSEKMSKeyID` with KMS encryption to select a key.
+- `ContentDisposition`: optional, for example `attachment`.
+
+`Logging.logfile_location` is a **directory**, not a file. Logs are written to `s3backup.log` there and rotated automatically. `max_size` is in megabytes, `max_age` in days, and `max_backups` is a file count; zero uses Lumberjack's default/unlimited retention semantics. Keep logs outside backup directories. New directories/files use restrictive permissions.
 
 ## Usage
 
-### Running with Config File
+```sh
+# Preview changes first; dry-run prints planned actions to stderr.
+./s3backup -config config.json -backup -sync -dry-run
 
-After downloading the binary for your platform and preparing your config file, run the binary with the `-config` flag to specify the path to your configuration:
+# Back up, then remove missing files only if the backup succeeds.
+./s3backup -config config.json -backup -sync -console
 
-```bash
-# Make it executable (Linux/macOS only)
-chmod +x s3backup-linux-amd64
+# Limit the overall run time; Ctrl-C also cancels requests.
+./s3backup -config config.json -backup -timeout 30m
 
-# Run with config file
-./s3backup-linux-amd64 -config ./config.json -backup
+# Wipe current objects, then back up again.
+./s3backup -config config.json -wipe -backup
 ```
 
-The binary accepts various flags to control backup, wipe, and sync behavior:
+| Flag | Default | Behavior |
+| --- | --- | --- |
+| `-config` | `/etc/config.json` | Configuration file |
+| `-backup` | false | Back up configured directories |
+| `-sync` | false | Delete missing local files within configured prefixes |
+| `-wipe` | false | Delete every current object in the bucket |
+| `-force` | false | Skip wipe confirmation; requires `-wipe` |
+| `-dry-run` | false | List planned actions without uploading/deleting |
+| `-timeout` | `0` | Overall timeout, such as `30m`; zero means no deadline |
+| `-console` | false | Also log to stderr |
+| `-llevel` | `info` | Logging level |
+| `-help` | false | Print usage and exit |
+| `-version` | false | Print build version and exit |
 
-### Flags
+No operation flags prints usage. Wipe prompts on stderr and requires typing the bucket name unless `-force` or `-dry-run` is set. Successful wipe-only runs exit successfully. Failures return a nonzero exit code and prevent subsequent operations.
 
-| Flag | Type | Default | Description |
-| --- | --- | --- | --- |
-| `-config` | `string` | `/etc/config.json` | Path to the configuration file. |
-| `-backup` | `bool` | `false` | Run backup for directories listed in `AWS.BackupDirectories`. |
-| `-sync` | `bool` | `false` | Remove S3 objects that do not exist on local disk. |
-| `-wipe` | `bool` | `false` | Delete all objects in the configured S3 bucket. |
-| `-force` | `bool` | `false` | Skip confirmation prompt when `-wipe` is used. |
-| `-help` | `bool` | `false` | Print help/usage details. |
-| `-llevel` | `string` | `info` | Log level (`debug`, `info`, `warn`, `error`, `fatal`, `panic`). |
-| `-console` | `bool` | `false` | Enable console logging in addition to logfile output. |
+## Backup and cleanup behavior
 
-### Behavior Notes
+- Keys are canonical absolute paths with forward slashes, preserving the existing leading slash on Unix: `/home/user/Documents/file.txt`. Relative roots are resolved against the process working directory. Windows keys include the drive prefix. Moving roots or switching platforms does not migrate existing keys.
+- Only regular files are uploaded; symlinks, sockets, devices, and empty directories are skipped. Contents are streamed with bounded memory. Files above 5 GiB are rejected with an explicit error; multipart upload is not implemented.
+- Files are hashed with SHA-256 on every run. The hash is stored in object metadata and sent to S3 for upload verification. This detects content changes even when timestamps are preserved or moved backward. Source files should be stable; this is not a filesystem snapshot or database backup tool.
+- **Migration:** old objects without `s3backup-sha256` metadata are uploaded again on their first backup. This can add request/storage costs and new versions. Preview with `-dry-run` before the first run.
+- Conditional writes guard against remote changes between HEAD and PUT. Sync uses listed ETags for conditional deletion. Conflicts fail the run so you can retry after resolving concurrent writers.
+- Sync paginates through every configured prefix and preserves unrelated keys, directory markers, noncanonical keys, existing symlinks, and special files. Missing/unreadable roots or filesystem errors stop sync. Removed source roots are not automatically purged from S3. An empty mounted directory still looks empty: verify removable/network filesystems are mounted before syncing.
+- Wipe covers the whole bucket, including unrelated prefixes. In versioned buckets, wipe and sync create delete markers; they **do not purge historical versions or existing delete markers**. Object Lock and permission failures are reported, including partial batch failures. A failed run may already have uploaded or deleted some objects; operations are not transactional.
+- Dry-run makes read requests and writes local logs, but does not mutate S3. A combined wipe/backup dry-run compares against current objects, so it is not an exact simulation of post-wipe uploads.
 
-- `-wipe` without `-force` prompts for confirmation.
-- `-wipe` can be combined with `-backup` to do a clean-slate backup.
-- `-sync` is independent and can be used with or without `-backup`.
-- If neither `-backup` nor `-sync` is set, the app initializes and exits after setup checks.
+## AWS operations
 
-### Examples
+Use a dedicated backup bucket with Block Public Access, encryption at rest, HTTPS, and least-privileged permissions. The application needs `s3:ListBucket` on the bucket and `s3:GetObject`/`s3:PutObject` on its backup prefixes; cleanup additionally needs `s3:DeleteObject`. Explicit ACLs and KMS encryption require their corresponding permissions. Versioning or Object Lock can help protect against accidental deletion; configure retention separately.
 
-Backup using a custom config file:
+Consider S3 access logging, CloudTrail data events, and CloudWatch metrics, with encrypted log destinations. These observability features and KMS usage can add charges. HEAD/PUT/LIST/DELETE requests, retained versions, and archive-class minimum retention/retrieval charges also affect cost. Hashing reads every local file, trading disk I/O for reliable change detection.
 
-```bash
-./s3backup -config ./config/config.json -backup
-```
+See [AWS object ownership guidance](https://docs.aws.amazon.com/AmazonS3/latest/userguide/about-object-ownership.html), [conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html), and [S3 pricing](https://aws.amazon.com/s3/pricing/).
 
-Wipe bucket and then run a fresh backup:
-
-```bash
-./s3backup -config ./config/config.json -wipe -force -backup
-```
-
-Sync S3 with local filesystem and enable console logs:
-
-```bash
-./s3backup -config ./config/config.json -sync -console -llevel info
-```
-
+The repository review and remaining limits are recorded in [docs/review.md](docs/review.md).

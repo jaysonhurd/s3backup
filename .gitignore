@@ -1,6 +1,7 @@
-config.json
-!fixtures/tests/*.json
+/config.json
+.idea/
 go_build*
-./idea*
-.idea*
-go.sum
+/s3backup
+/s3backup.exe
+/dist/
+*.log

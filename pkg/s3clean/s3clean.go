@@ -3,166 +3,232 @@ package s3clean
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/smithy-go"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/jaysonhurd/s3backup/models"
 	"github.com/rs/zerolog"
 )
 
-const (
-	msgListObjectsBucketError = "Unable to list objects in bucket"
-	msgDeleteObjectsBucketErr = "Unable to delete objects from bucket"
-	msgMissingLocalFile       = "local file does not exist, attempting S3 removal"
-	msgUnableToRemoveS3File   = "unable to remove object from S3; continuing"
-	msgRemovedFromS3          = "removed object from S3"
-	msgDeleteObjectFailed     = "delete object failed"
-	msgNoSuchBucket           = "NoSuchBucket"
-	msgListObjectsFailed      = "list objects failed"
-)
-
 type S3Cleaner interface {
-	SyncS3Bucket() (err error)
-	WipeS3Bucket() (err error)
+	SyncS3Bucket() error
+	WipeS3Bucket() error
 }
-
+type S3API interface {
+	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	DeleteObjects(context.Context, *s3.DeleteObjectsInput, ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error)
+}
 type s3clean struct {
+	ctx context.Context
 	cfg models.Config
 	svc S3API
 	l   *zerolog.Logger
 }
 
-type S3API interface {
-	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
-	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
-	DeleteObjects(ctx context.Context, params *s3.DeleteObjectsInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error)
+func New(cfg models.Config, svc S3API, l *zerolog.Logger) S3Cleaner {
+	return NewWithContext(context.Background(), cfg, svc, l)
+}
+func NewWithContext(ctx context.Context, cfg models.Config, svc S3API, l *zerolog.Logger) S3Cleaner {
+	if l == nil {
+		logger := zerolog.Nop()
+		l = &logger
+	}
+	return &s3clean{ctx: ctx, cfg: cfg, svc: svc, l: l}
 }
 
-func New(
-	cfg models.Config,
-	svc S3API,
-	l *zerolog.Logger,
-) S3Cleaner {
-	return &s3clean{
-		cfg: cfg,
-		svc: svc,
-		l:   l,
-	}
-}
-
-// Wipes out the entire bucket.  This can be used by itself to empty a bucket
-// or before a backup if a clean start backup is required.
-func (s *s3clean) WipeS3Bucket() (err error) {
-	ctx := context.Background()
-	p := s3.NewListObjectsV2Paginator(s.svc, &s3.ListObjectsV2Input{Bucket: aws.String(s.cfg.AWS.S3Bucket)})
-
-	for p.HasMorePages() {
-		page, pageErr := p.NextPage(ctx)
-		if pageErr != nil {
-			s.l.Error().Err(pageErr).Str("bucket", s.cfg.AWS.S3Bucket).Msg(msgListObjectsBucketError)
-			return pageErr
-		}
-
-		if len(page.Contents) == 0 {
-			continue
-		}
-
-		objects := make([]s3types.ObjectIdentifier, 0, len(page.Contents))
-		for i := range page.Contents {
-			if page.Contents[i].Key == nil {
-				continue
-			}
-			objects = append(objects, s3types.ObjectIdentifier{Key: page.Contents[i].Key})
-		}
-
-		if len(objects) == 0 {
-			continue
-		}
-
-		_, deleteErr := s.svc.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-			Bucket: aws.String(s.cfg.AWS.S3Bucket),
-			Delete: &s3types.Delete{Objects: objects, Quiet: aws.Bool(true)},
-		})
-		if deleteErr != nil {
-			s.l.Error().Err(deleteErr).Str("bucket", s.cfg.AWS.S3Bucket).Msg(msgDeleteObjectsBucketErr)
-			return deleteErr
-		}
-	}
-
-	return nil
-}
-
-// This method is intended to be run after a backup but can be run by itself.
-// It is used to remove any files in S3 which do not exist in the backup list provided in
-// the config file.
-func (s *s3clean) SyncS3Bucket() (err error) {
-
-	input := s.createInput()
-
-	result, done := s.objectList(input)
-	if done {
-		return
-	}
-
-	for i := range result.Contents {
-		s3file := *result.Contents[i].Key
-		osfile := "/" + *result.Contents[i].Key
-		_, err = os.Open(osfile)
-		if errors.Is(err, os.ErrNotExist) {
-			s.l.Info().Str("local_path", osfile).Msg(msgMissingLocalFile)
-			err = s.deleteS3File(input, s3file)
-			if err != nil {
-				s.l.Warn().Err(err).Str("s3_key", s3file).Msg(msgUnableToRemoveS3File)
-			} else {
-				s.l.Info().Str("local_path", osfile).Str("s3_key", s3file).Msg(msgRemovedFromS3)
-			}
-		}
-	}
-
-	return nil
-}
-
-func (s *s3clean) deleteS3File(input *s3.ListObjectsV2Input, s3file string) error {
-
-	deleteInput := &s3.DeleteObjectInput{
-		Bucket: input.Bucket,
-		Key:    aws.String(s3file),
-	}
-	_, err := s.svc.DeleteObject(context.Background(), deleteInput)
-
-	if err != nil {
-		s.l.Info().Err(err).Msg(msgDeleteObjectFailed)
+// WipeS3Bucket deletes current objects. Versions and delete markers are retained.
+func (s *s3clean) WipeS3Bucket() error {
+	if err := s.cfg.Validate(); err != nil {
 		return err
 	}
+	return s.pages("", func(objects []types.Object) error {
+		ids := make([]types.ObjectIdentifier, 0, len(objects))
+		for _, object := range objects {
+			if object.Key == nil {
+				return fmt.Errorf("S3 returned an object without a key")
+			}
+			if s.cfg.DryRun {
+				s.l.Info().Str("key", *object.Key).Msg("would delete object")
+				continue
+			}
+			ids = append(ids, types.ObjectIdentifier{Key: object.Key})
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		result, err := s.svc.DeleteObjects(s.ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(s.cfg.AWS.S3Bucket), Delete: &types.Delete{Objects: ids, Quiet: aws.Bool(true)},
+		})
+		if err != nil {
+			return fmt.Errorf("delete objects: %w", err)
+		}
+		if result == nil {
+			return fmt.Errorf("delete objects returned an empty response")
+		}
+		var failures []error
+		for _, failure := range result.Errors {
+			failures = append(failures, fmt.Errorf("delete %q: %s: %s", aws.ToString(failure.Key), aws.ToString(failure.Code), aws.ToString(failure.Message)))
+		}
+		return errors.Join(failures...)
+	})
+}
 
+// SyncS3Bucket only examines canonical keys below the configured local roots.
+// OpenRoot prevents a remote key or local symlink from escaping those roots.
+func (s *s3clean) SyncS3Bucket() error {
+	if err := s.cfg.Validate(); err != nil {
+		return err
+	}
+	dirs, err := models.BackupRoots(s.cfg.AWS.BackupDirectories)
+	if err != nil {
+		return err
+	}
+	roots := make([]*os.Root, 0, len(dirs))
+	defer func() {
+		for _, root := range roots {
+			root.Close()
+		}
+	}()
+	// Validate every source before allowing any deletes, including unreadable subtrees.
+	for _, dir := range dirs {
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			return err
+		}
+		roots = append(roots, root)
+		if err := fs.WalkDir(root.FS(), ".", func(_ string, _ fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			return s.ctx.Err()
+		}); err != nil {
+			return fmt.Errorf("inspect backup root %q: %w", dir, err)
+		}
+	}
+	for i, dir := range dirs {
+		root := roots[i]
+		prefix := strings.TrimSuffix(filepath.ToSlash(dir), "/") + "/"
+		err := s.pages(prefix, func(objects []types.Object) error {
+			for _, object := range objects {
+				if err := s.ctx.Err(); err != nil {
+					return err
+				}
+				if object.Key == nil {
+					return fmt.Errorf("S3 returned an object without a key")
+				}
+				key := *object.Key
+				if !strings.HasPrefix(key, prefix) || strings.HasSuffix(key, "/") {
+					continue
+				}
+				relative := strings.TrimPrefix(key, prefix)
+				// Reject aliases (a/../b, repeated separators) and foreign-platform paths.
+				local, err := filepath.Localize(relative)
+				if err != nil || !filepath.IsLocal(local) {
+					continue
+				}
+				missing, err := localMissing(root, local)
+				if err != nil {
+					return fmt.Errorf("inspect local file %q: %w", key, err)
+				}
+				if !missing {
+					continue
+				}
+				// A disappeared/replaced configured root must never look like an empty backup.
+				original, statErr := root.Stat(".")
+				if statErr != nil {
+					return statErr
+				}
+				current, statErr := os.Stat(dir)
+				if statErr != nil {
+					return statErr
+				}
+				if !os.SameFile(original, current) {
+					return fmt.Errorf("backup root %q changed during sync", dir)
+				}
+				if aws.ToString(object.ETag) == "" {
+					return fmt.Errorf("object %q has no ETag; refusing an unconditional sync deletion", key)
+				}
+				if s.cfg.DryRun {
+					s.l.Info().Str("key", key).Msg("would delete missing file")
+					continue
+				}
+				input := &s3.DeleteObjectInput{Bucket: aws.String(s.cfg.AWS.S3Bucket), Key: object.Key, IfMatch: object.ETag}
+				if _, err := s.svc.DeleteObject(s.ctx, input); err != nil {
+					return fmt.Errorf("delete %q: %w", key, err)
+				}
+				s.l.Info().Str("key", key).Msg("deleted missing file")
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func (s *s3clean) createInput() *s3.ListObjectsV2Input {
-	input := &s3.ListObjectsV2Input{
-		Bucket:  aws.String(s.cfg.AWS.S3Bucket),
-		MaxKeys: aws.Int32(200),
+func (s *s3clean) pages(prefix string, visit func([]types.Object) error) error {
+	input := &s3.ListObjectsV2Input{Bucket: aws.String(s.cfg.AWS.S3Bucket), MaxKeys: aws.Int32(1000)}
+	if prefix != "" {
+		input.Prefix = aws.String(prefix)
 	}
-	return input
+	var previous string
+	for {
+		if err := s.ctx.Err(); err != nil {
+			return err
+		}
+		page, err := s.svc.ListObjectsV2(s.ctx, input)
+		if err != nil {
+			return fmt.Errorf("list objects: %w", err)
+		}
+		if page == nil {
+			return fmt.Errorf("list objects returned an empty response")
+		}
+		truncated := aws.ToBool(page.IsTruncated)
+		next := aws.ToString(page.NextContinuationToken)
+		if truncated && (next == "" || next == previous) {
+			return fmt.Errorf("S3 returned an invalid continuation token")
+		}
+		if len(page.Contents) > 1000 {
+			return fmt.Errorf("S3 returned more than 1000 objects in a page")
+		}
+		if err := visit(page.Contents); err != nil {
+			return err
+		}
+		if !truncated {
+			return nil
+		}
+
+		previous = next
+		input.ContinuationToken = aws.String(next)
+	}
 }
 
-func (s *s3clean) objectList(input *s3.ListObjectsV2Input) (*s3.ListObjectsV2Output, bool) {
-	result, err := s.svc.ListObjectsV2(context.Background(), input)
-	if err != nil {
-		var apiErr smithy.APIError
-		if errors.As(err, &apiErr) {
-			if apiErr.ErrorCode() == "NoSuchBucket" {
-				s.l.Info().Err(err).Msg(msgNoSuchBucket)
-			} else {
-				s.l.Info().Err(err).Msg(msgListObjectsFailed)
-			}
-		} else {
-			s.l.Info().Err(err).Msg(msgListObjectsFailed)
+// A symlink subtree was never backed up, so its remote keys must be retained,
+// including dangling symlinks that would otherwise look like missing files.
+func localMissing(root *os.Root, local string) (bool, error) {
+	parts := strings.Split(local, string(filepath.Separator))
+	for i := range parts {
+		info, err := root.Lstat(filepath.Join(parts[:i+1]...))
+		if errors.Is(err, os.ErrNotExist) {
+			return true, nil
 		}
-		return nil, true
+		if err != nil {
+			return false, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return false, nil
+		}
+		if i < len(parts)-1 && !info.IsDir() {
+			return false, fmt.Errorf("parent path is no longer a directory")
+		}
 	}
-	return result, false
+	return false, nil
 }

@@ -1,101 +1,92 @@
 package utilities
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
-	"path"
+	"path/filepath"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/jaysonhurd/s3backup/models"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-const (
-	msgLoadAWSConfigFailed = "unable to load AWS configuration"
-	msgProgramUsageHelp    = `Program Usage:
-		-backup : 	Backs up the filesystems listed in config.json (default is false)
-		-config : 	Relative or full path to config file (requires a valid path e.g. '-config configs/config.json'
-		-sync 	: 	Reconciles s3 with local filesystem.  Any files not found on the local filesystem
-					will be removed from S3 (default is false)
-		-wipe 	: 	Wipes the entire S3 bucket from the config.json file (Default is false)
-		-force	:	Forces a wipe without asking for confirmation (Default is false)
-		-level  :   Which logging level - Info, Warn, Error, Debug (Default is Error)
-		-console :  If you would also like to log to console in addition to the logfile. Default is off (false)
-		`
-)
-
 func CreateAWSSession(cfg models.Config, l *zerolog.Logger) (aws.Config, error) {
-	loadOpts := []func(*config.LoadOptions) error{
-		config.WithRegion(cfg.AWS.S3Region),
-	}
-
-	if cfg.AWS.AccessKeyId != "" && cfg.AWS.SecretAccessKey != "" {
-		loadOpts = append(loadOpts, config.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(cfg.AWS.AccessKeyId, cfg.AWS.SecretAccessKey, ""),
-		))
-	}
-
-	awsCfg, err := config.LoadDefaultConfig(context.Background(), loadOpts...)
-	if err != nil {
-		if l != nil {
-			l.Error().Err(err).Msg(msgLoadAWSConfigFailed)
-		}
-		return aws.Config{}, err
-	}
-
-	return awsCfg, nil
+	return CreateAWSConfig(context.Background(), cfg)
 }
 
-func LoadConfig(configFile string) (models.Config, error) {
-	var BackupConfig models.Config
-	_, err := os.Stat(configFile)
-	if err != nil {
-		return BackupConfig, err
+func CreateAWSConfig(ctx context.Context, cfg models.Config) (aws.Config, error) {
+	if (cfg.AWS.AccessKeyId == "") != (cfg.AWS.SecretAccessKey == "") {
+		return aws.Config{}, fmt.Errorf("AccessKeyId and SecretAccessKey must be provided together")
 	}
-	f, err := os.ReadFile(configFile)
-	if err != nil {
-		return BackupConfig, err
+	opts := []func(*config.LoadOptions) error{}
+	if cfg.AWS.S3Region != "" {
+		opts = append(opts, config.WithRegion(cfg.AWS.S3Region))
 	}
-	err = json.Unmarshal(f, &BackupConfig)
-	if err != nil {
-		return BackupConfig, err
+	if cfg.AWS.AccessKeyId != "" {
+		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AWS.AccessKeyId, cfg.AWS.SecretAccessKey, cfg.AWS.SessionToken)))
 	}
-	return BackupConfig, err
+	result, err := config.LoadDefaultConfig(ctx, opts...)
+	if err != nil {
+		return aws.Config{}, fmt.Errorf("load AWS configuration: %w", err)
+	}
+	if result.Region == "" {
+		return aws.Config{}, fmt.Errorf("AWS region is required in config, environment, or shared AWS profile")
+	}
+	return result, nil
 }
 
-func LoggerSetup(cfg models.Config, llevel zerolog.Level) (*zerolog.Logger, error) {
-	var (
-		l   zerolog.Logger
-		err error
-	)
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
-	zerolog.SetGlobalLevel(llevel)
+func LoadConfig(filename string) (models.Config, error) {
+	var cfg models.Config
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return cfg, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cfg); err != nil {
+		return cfg, fmt.Errorf("decode configuration: %w", err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return cfg, fmt.Errorf("configuration must contain exactly one JSON object")
+	}
+	return cfg, cfg.Validate()
+}
 
-	logFileName := "s3backup.log"
+func LoggerSetup(cfg models.Config, level zerolog.Level) (*zerolog.Logger, error) {
+	l, _, err := OpenLogger(cfg, level)
+	return l, err
+}
 
-	lfile := zerolog.New(&lumberjack.Logger{
-		Filename:   path.Join(cfg.Logging.LogfileLocation, logFileName),
-		MaxBackups: cfg.Logging.MaxBackups, // files
-		MaxSize:    cfg.Logging.MaxSize,    // megabytes
-		MaxAge:     cfg.Logging.MaxAge,     // days
-	})
-
+// OpenLogger returns a closer so rotation files are flushed/closed on normal exit.
+func OpenLogger(cfg models.Config, level zerolog.Level) (*zerolog.Logger, io.Closer, error) {
+	dir := cfg.Logging.LogfileLocation
+	if dir == "" {
+		dir = "."
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, nil, fmt.Errorf("create log directory: %w", err)
+	}
+	filename := filepath.Join(dir, "s3backup.log")
+	// Open now so permission/path errors cannot disappear in the logging writer.
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open log: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, nil, err
+	}
+	rotation := &lumberjack.Logger{Filename: filename, MaxBackups: cfg.Logging.MaxBackups, MaxSize: cfg.Logging.MaxSize, MaxAge: cfg.Logging.MaxAge}
+	var writer io.Writer = rotation
 	if cfg.Logging.Console {
-		consoleWriter := zerolog.ConsoleWriter{Out: os.Stdout}
-		multi := zerolog.MultiLevelWriter(consoleWriter, lfile)
-		l = zerolog.New(multi).With().Timestamp().Logger()
-	} else {
-		l = zerolog.New(lfile).With().Caller().Timestamp().Logger()
+		writer = zerolog.MultiLevelWriter(rotation, zerolog.ConsoleWriter{Out: os.Stderr})
 	}
-
-	return &l, err
-}
-
-func PrintHelp() {
-	log.Info().Msg(msgProgramUsageHelp)
+	l := zerolog.New(writer).Level(level).With().Timestamp().Logger()
+	return &l, rotation, nil
 }

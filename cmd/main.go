@@ -1,173 +1,156 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/jaysonhurd/s3backup/models"
 	"github.com/jaysonhurd/s3backup/pkg/s3backup"
 	"github.com/jaysonhurd/s3backup/pkg/s3clean"
 	"github.com/jaysonhurd/s3backup/pkg/utilities"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
-const (
-	msgInvalidLoggerLevel    = "Invalid logger format! Options are: info, warn, error, fatal"
-	msgLoadConfigFailed      = "Failed to load config file"
-	msgCreateAWSConfigFailed = "Unable to create AWS config"
-	msgWipeWarning           = "You have selected the -wipe option. THIS WILL WIPE OUT ALL FILES IN YOUR BUCKET."
-	msgWipeContinuePrompt    = "Do you wish to continue? [y/n]"
-	msgProgramExiting        = "Exiting program"
-	msgInvalidWipeResponse   = "Exiting program, invalid response!"
-	msgBucketWiped           = "Bucket has been wiped from S3"
-	msgNoBackupRequested     = "You have requested to not back up. If you wish to back up, please re-run either without the -clean or with the -backup flag"
-	msgWipeNotSelected       = "Wipe option not selected, bucket will not be wiped prior to any backup"
-	msgBackupDirectoryIssue  = "Issue with backup directory found"
-	msgSyncBucketFailed      = "syncBucket failed"
-	msgSyncNotSelected       = "Sync not selected. Any files located on S3 but not on the local filesystem will not be removed from S3"
-)
-
-//TODO: Write tests (centralized fakes for each package)
-//TODO: Clean up flag branching - hard to read
-//TODO: Write parallel option using wait groups and a goroutine for each directory structure given
-//TODO: Write README.md
-//TODO: Add a goroutine to continue checking for changed files and backing them up if they change
-//TODO: Restore option
-//TODO: Create RPM package for distribution
-//TODO: Create .deb package for distribution
+var version = "dev"
 
 func main() {
-
-	var (
-		// Flags
-		fconfig  = flag.String("config", "/etc/config.json", "path to the configuration file")
-		fsync    = flag.Bool("sync", false, "After backup, perform a sync by removing files in S3 which no longer exist on the local filesystem")
-		fbackup  = flag.Bool("backup", false, "Use this value if doing a fwipe (-clean) if you want to also start a fresh new backup")
-		fwipe    = flag.Bool("wipe", false, "Wipe the bucket clean entirely - this is destructive")
-		fhelp    = flag.Bool("help", false, "Provide help file info")
-		fforce   = flag.Bool("force", false, "Force a wipe without asking for confirmation. Caution!!")
-		llevel   = flag.String("llevel", "info", "Logging level - default is info")
-		fconsole = flag.Bool("console", false, "Use this flag to also log at console level")
-		//background = flag.Bool("background", false, "Runs in the background to check for any changed file, then uploads")
-
-		// Error values used for structured logging when no upstream error exists.
-		errInvalidWipeResponse = errors.New(msgInvalidWipeResponse)
-		errNoBackupRequested   = errors.New(msgNoBackupRequested)
-		errSyncNotSelected     = errors.New(msgSyncNotSelected)
-		errWipeNotSelected     = errors.New(msgWipeNotSelected)
-
-		// Misc vars
-		logLevel zerolog.Level
-		err      error
-
-		awsCfg aws.Config
-		svc    *s3.Client
-	)
-
-	// Begin setup items
-	flag.Parse()
-	if *fhelp {
-		utilities.PrintHelp()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
+		fmt.Fprintln(os.Stderr, "s3backup:", err)
+		os.Exit(1)
 	}
-	// Set up logging with zerolog
-	if *llevel == "" {
-		logLevel = zerolog.ErrorLevel
-	}
-	if *llevel != "" {
-		logLevel, err = zerolog.ParseLevel(*llevel)
-		if err != nil {
-			log.Error().Err(err).Msg(msgInvalidLoggerLevel)
+}
+
+func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("s3backup", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configFile := flags.String("config", "/etc/config.json", "path to the configuration file")
+	backup := flags.Bool("backup", false, "back up configured directories")
+	sync := flags.Bool("sync", false, "delete missing local files from configured S3 prefixes")
+	wipe := flags.Bool("wipe", false, "delete all current objects in the bucket (retains object versions)")
+	force := flags.Bool("force", false, "skip wipe confirmation")
+	dryRun := flags.Bool("dry-run", false, "report planned uploads/deletions without changing S3")
+	level := flags.String("llevel", "info", "logging level: trace, debug, info, warn, error, fatal, panic, disabled")
+	console := flags.Bool("console", false, "also log to stderr")
+	help := flags.Bool("help", false, "show usage")
+	showVersion := flags.Bool("version", false, "show build version")
+	timeout := flags.Duration("timeout", 0, "overall operation timeout (e.g. 30m); zero disables")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
 		}
+		return err
 	}
-
-	cfg, err := utilities.LoadConfig(*fconfig)
+	if *help {
+		flags.PrintDefaults()
+		return nil
+	}
+	if *showVersion {
+		fmt.Fprintln(stdout, version)
+		return nil
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected positional arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	if *force && !*wipe {
+		return fmt.Errorf("-force requires -wipe")
+	}
+	if *timeout < 0 {
+		return fmt.Errorf("-timeout cannot be negative")
+	}
+	logLevel, err := zerolog.ParseLevel(*level)
 	if err != nil {
-		log.Fatal().Err(err).Msg(msgLoadConfigFailed)
-		os.Exit(0)
+		return err
 	}
-
-	if *fconsole {
-		cfg.Logging.Console = *fconsole
+	if !*backup && !*sync && !*wipe {
+		flags.PrintDefaults()
+		return nil
 	}
-
-	l, err := utilities.LoggerSetup(cfg, logLevel)
-
-	awsCfg, err = utilities.CreateAWSSession(cfg, l)
+	if *timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(*timeout))
+		defer cancel()
+	}
+	cfg, err := utilities.LoadConfig(*configFile)
 	if err != nil {
-		l.Fatal().Err(err).Msg(msgCreateAWSConfigFailed)
+		return err
 	}
-	svc = s3.NewFromConfig(awsCfg)
-
-	// Begin backup procedures
-	if *fwipe {
-		if !*fforce {
-			l.Warn().
-				Str("bucket", cfg.AWS.S3Bucket).
-				Str("region", cfg.AWS.S3Region).
-				Msg(msgWipeWarning)
-			l.Warn().Msg(msgWipeContinuePrompt)
-			var answer string
-			_, err = fmt.Scanln(&answer)
-			if err != nil {
-				log.Fatal().Err(err).Msg(msgProgramExiting)
-			}
-			if answer != "y" {
-				l.Fatal().Err(errInvalidWipeResponse).Msg(msgInvalidWipeResponse)
-				os.Exit(1)
-			}
-		}
-		bucketToWipe := s3clean.New(
-			cfg,
-			svc,
-			l,
-		)
-		err = bucketToWipe.WipeS3Bucket()
+	cfg.DryRun = *dryRun
+	cfg.Logging.Console = cfg.Logging.Console || *console || *dryRun
+	if *backup || *sync {
+		cfg.AWS.BackupDirectories, err = models.BackupRoots(cfg.AWS.BackupDirectories)
 		if err != nil {
-			log.Fatal().Err(err).Msg(msgProgramExiting)
+			return err
 		}
-		l.Info().Str("bucket", cfg.AWS.S3Bucket).Msg(msgBucketWiped)
-
-		if !*fbackup {
-			l.Fatal().Err(errNoBackupRequested).Msg(msgNoBackupRequested)
-			os.Exit(1)
-		}
-
-	} else {
-		l.Warn().Err(errWipeNotSelected).Msg(msgWipeNotSelected)
 	}
-
-	if *fbackup {
-		for i := range cfg.AWS.BackupDirectories {
-			backup := s3backup.New(
-				cfg,
-				svc,
-				cfg.AWS.BackupDirectories[i],
-				l,
-			)
-			err = backup.BackupDirectory()
-			if err != nil {
-				l.Fatal().Err(err).Msg(msgBackupDirectoryIssue)
+	l, closer, err := utilities.OpenLogger(cfg, logLevel)
+	if err != nil {
+		return err
+	}
+	defer closer.Close()
+	awsCfg, err := utilities.CreateAWSConfig(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	svc := s3.NewFromConfig(awsCfg)
+	cleaner := s3clean.NewWithContext(ctx, cfg, svc, l)
+	if *wipe {
+		if !*force && !*dryRun {
+			fmt.Fprintf(stderr, "Delete all current objects in bucket %q? Type the bucket name to confirm: ", cfg.AWS.S3Bucket)
+			answer, err := readAnswer(ctx, stdin)
+			if err != nil && !errors.Is(err, io.EOF) {
+				return err
+			}
+			if strings.TrimSpace(answer) != cfg.AWS.S3Bucket {
+				return fmt.Errorf("wipe cancelled")
+			}
+		}
+		if err := cleaner.WipeS3Bucket(); err != nil {
+			return err
+		}
+		l.Info().Bool("dry_run", cfg.DryRun).Msg("wipe completed; historical versions and delete markers are retained")
+	}
+	if *backup {
+		for _, dir := range cfg.AWS.BackupDirectories {
+			if err := s3backup.NewWithContext(ctx, cfg, svc, dir, l).BackupDirectory(); err != nil {
+				return err
 			}
 		}
 	}
-
-	if *fsync {
-		if *fsync {
-			cleanBucket := s3clean.New(
-				cfg,
-				svc,
-				l,
-			)
-			err = cleanBucket.SyncS3Bucket()
-			if err != nil {
-				l.Error().Err(err).Str("bucket", cfg.AWS.S3Bucket).Msg(msgSyncBucketFailed)
-			}
+	if *sync {
+		if err := cleaner.SyncS3Bucket(); err != nil {
+			return err
 		}
-	} else {
-		l.Warn().Err(errSyncNotSelected).Msg(msgSyncNotSelected)
+	}
+	return nil
+}
+
+// Keep cancellation responsive while waiting for interactive confirmation.
+func readAnswer(ctx context.Context, in io.Reader) (string, error) {
+	type response struct {
+		answer string
+		err    error
+	}
+	ready := make(chan response, 1)
+	go func() {
+		answer, err := bufio.NewReader(in).ReadString('\n')
+		ready <- response{answer, err}
+	}()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case result := <-ready:
+		return result.answer, result.err
 	}
 }
