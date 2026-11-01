@@ -7,6 +7,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// TestCreateAWSSession supports test create a w s session.
 func TestCreateAWSSession(t *testing.T) {
 	cfg := models.Config{AWS: models.AWS{S3Region: "us-east-1"}}
 	l := zerolog.Nop()
@@ -21,6 +22,7 @@ func TestCreateAWSSession(t *testing.T) {
 	}
 }
 
+// TestLoadConfig supports test load config.
 func TestLoadConfig(t *testing.T) {
 	type args struct {
 		configFile string

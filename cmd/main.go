@@ -1,21 +1,23 @@
 package main
 
 import (
-	"errors"
+	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/jaysonhurd/s3backup/internal/logging"
 	"github.com/jaysonhurd/s3backup/pkg/s3backup"
 	"github.com/jaysonhurd/s3backup/pkg/s3clean"
 	"github.com/jaysonhurd/s3backup/pkg/utilities"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 )
 
 const (
+	msgLoggerSetupFailed     = "Unable to initialize logger"
 	msgInvalidLoggerLevel    = "Invalid logger format! Options are: info, warn, error, fatal"
 	msgLoadConfigFailed      = "Failed to load config file"
 	msgCreateAWSConfigFailed = "Unable to create AWS config"
@@ -40,6 +42,7 @@ const (
 //TODO: Create RPM package for distribution
 //TODO: Create .deb package for distribution
 
+// main configures dependencies and runs the requested S3 operations.
 func main() {
 
 	var (
@@ -54,12 +57,6 @@ func main() {
 		fconsole = flag.Bool("console", false, "Use this flag to also log at console level")
 		//background = flag.Bool("background", false, "Runs in the background to check for any changed file, then uploads")
 
-		// Error values used for structured logging when no upstream error exists.
-		errInvalidWipeResponse = errors.New(msgInvalidWipeResponse)
-		errNoBackupRequested   = errors.New(msgNoBackupRequested)
-		errSyncNotSelected     = errors.New(msgSyncNotSelected)
-		errWipeNotSelected     = errors.New(msgWipeNotSelected)
-
 		// Misc vars
 		logLevel zerolog.Level
 		err      error
@@ -72,22 +69,22 @@ func main() {
 	flag.Parse()
 	if *fhelp {
 		utilities.PrintHelp()
+		return
 	}
-	// Set up logging with zerolog
+	// Retain legacy logger configuration at public API boundaries.
 	if *llevel == "" {
 		logLevel = zerolog.ErrorLevel
 	}
 	if *llevel != "" {
 		logLevel, err = zerolog.ParseLevel(*llevel)
 		if err != nil {
-			log.Error().Err(err).Msg(msgInvalidLoggerLevel)
+			slog.Default().Error(msgInvalidLoggerLevel, slog.Any("error", err))
 		}
 	}
 
 	cfg, err := utilities.LoadConfig(*fconfig)
 	if err != nil {
-		log.Fatal().Err(err).Msg(msgLoadConfigFailed)
-		os.Exit(0)
+		fatal(slog.Default(), msgLoadConfigFailed, slog.Any("error", err))
 	}
 
 	if *fconsole {
@@ -95,29 +92,28 @@ func main() {
 	}
 
 	l, err := utilities.LoggerSetup(cfg, logLevel)
+	if err != nil {
+		fatal(slog.Default(), msgLoggerSetupFailed, slog.Any("error", err))
+	}
 
 	awsCfg, err = utilities.CreateAWSSession(cfg, l)
 	if err != nil {
-		l.Fatal().Err(err).Msg(msgCreateAWSConfigFailed)
+		fatal(logging.FromLegacy(l), msgCreateAWSConfigFailed, slog.Any("error", err))
 	}
 	svc = s3.NewFromConfig(awsCfg)
 
 	// Begin backup procedures
 	if *fwipe {
 		if !*fforce {
-			l.Warn().
-				Str("bucket", cfg.AWS.S3Bucket).
-				Str("region", cfg.AWS.S3Region).
-				Msg(msgWipeWarning)
-			l.Warn().Msg(msgWipeContinuePrompt)
+			logging.FromLegacy(l).Warn(msgWipeWarning, slog.String("bucket", cfg.AWS.S3Bucket), slog.String("region", cfg.AWS.S3Region))
+			logging.FromLegacy(l).Warn(msgWipeContinuePrompt)
 			var answer string
 			_, err = fmt.Scanln(&answer)
 			if err != nil {
-				log.Fatal().Err(err).Msg(msgProgramExiting)
+				fatal(slog.Default(), msgProgramExiting, slog.Any("error", err))
 			}
 			if answer != "y" {
-				l.Fatal().Err(errInvalidWipeResponse).Msg(msgInvalidWipeResponse)
-				os.Exit(1)
+				fatal(logging.FromLegacy(l), msgInvalidWipeResponse)
 			}
 		}
 		bucketToWipe := s3clean.New(
@@ -127,17 +123,16 @@ func main() {
 		)
 		err = bucketToWipe.WipeS3Bucket()
 		if err != nil {
-			log.Fatal().Err(err).Msg(msgProgramExiting)
+			fatal(slog.Default(), msgProgramExiting, slog.Any("error", err))
 		}
-		l.Info().Str("bucket", cfg.AWS.S3Bucket).Msg(msgBucketWiped)
+		logging.FromLegacy(l).Info(msgBucketWiped, slog.String("bucket", cfg.AWS.S3Bucket))
 
 		if !*fbackup {
-			l.Fatal().Err(errNoBackupRequested).Msg(msgNoBackupRequested)
-			os.Exit(1)
+			fatal(logging.FromLegacy(l), msgNoBackupRequested)
 		}
 
 	} else {
-		l.Warn().Err(errWipeNotSelected).Msg(msgWipeNotSelected)
+		logging.FromLegacy(l).Warn(msgWipeNotSelected)
 	}
 
 	if *fbackup {
@@ -150,24 +145,28 @@ func main() {
 			)
 			err = backup.BackupDirectory()
 			if err != nil {
-				l.Fatal().Err(err).Msg(msgBackupDirectoryIssue)
+				fatal(logging.FromLegacy(l), msgBackupDirectoryIssue, slog.Any("error", err))
 			}
 		}
 	}
 
 	if *fsync {
-		if *fsync {
-			cleanBucket := s3clean.New(
-				cfg,
-				svc,
-				l,
-			)
-			err = cleanBucket.SyncS3Bucket()
-			if err != nil {
-				l.Error().Err(err).Str("bucket", cfg.AWS.S3Bucket).Msg(msgSyncBucketFailed)
-			}
+		cleanBucket := s3clean.New(
+			cfg,
+			svc,
+			l,
+		)
+		err = cleanBucket.SyncS3Bucket()
+		if err != nil {
+			logging.FromLegacy(l).Error(msgSyncBucketFailed, slog.Any("error", err), slog.String("bucket", cfg.AWS.S3Bucket))
 		}
 	} else {
-		l.Warn().Err(errSyncNotSelected).Msg(msgSyncNotSelected)
+		logging.FromLegacy(l).Warn(msgSyncNotSelected)
 	}
+}
+
+// fatal logs a startup or command failure and exits unsuccessfully.
+func fatal(logger *slog.Logger, message string, attrs ...any) {
+	logger.Log(context.Background(), logging.LevelFatal, message, attrs...)
+	os.Exit(1)
 }

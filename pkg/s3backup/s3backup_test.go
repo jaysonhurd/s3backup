@@ -1,6 +1,7 @@
 package s3backup_test
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -15,237 +16,133 @@ import (
 	"github.com/rs/zerolog"
 )
 
-var (
-	l             = zerolog.Nop()
-	fakes3api     *s3api.FakeS3API
-	backup        s3backup.S3backuper
-	svc           *s3.Client
-	testDirectory = "test"
-	cfg           models.Config
-	err           error
-	myTime        time.Time
-)
+var errTestS3 = errors.New("S3 request failed")
 
-func TestBackupDirectoryNothingToDo(t *testing.T) {
-
-	cfg = models.Config{
-		AWS: models.AWS{
-			S3Region:             "somewhere",
-			S3Bucket:             "testbucket",
-			SecretAccessKey:      "xxxxxxx",
-			AccessKeyId:          "yyyyyyy",
-			BackupDirectories:    nil,
-			ACL:                  "",
-			ContentDisposition:   "",
-			ServerSideEncryption: "",
-			StorageClass:         "",
-		},
-		Logging: models.Logging{},
-	}
-	fakes3api = new(s3api.FakeS3API)
-	fakes3api.PutObjectReturns(&s3.PutObjectOutput{}, nil)
-	lastModified, err := time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
-	fakes3api.HeadObjectReturns(&s3.HeadObjectOutput{LastModified: &lastModified}, nil)
-	myTime, _ = time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
-	myS3 := s3backup.New(cfg, fakes3api, testDirectory, &l)
-
-	err = myS3.BackupDirectory()
-	if err != nil {
-		t.Fail()
-	}
-}
-
-func TestBackupDirectoryNonExistentDirectory(t *testing.T) {
-
-	cfg = models.Config{
-		AWS: models.AWS{
-			S3Region:             "somewhere",
-			S3Bucket:             "testbucket",
-			SecretAccessKey:      "xxxxxxx",
-			AccessKeyId:          "yyyyyyy",
-			BackupDirectories:    nil,
-			ACL:                  "",
-			ContentDisposition:   "",
-			ServerSideEncryption: "",
-			StorageClass:         "",
-		},
-		Logging: models.Logging{},
-	}
-	fakes3api = new(s3api.FakeS3API)
-	fakes3api.PutObjectReturns(&s3.PutObjectOutput{}, nil)
-	lastModified, err := time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
-	fakes3api.HeadObjectReturns(&s3.HeadObjectOutput{LastModified: &lastModified}, nil)
-	myTime, _ = time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
-	myS3 := s3backup.New(cfg, fakes3api, "nodirectory", &l)
-
-	err = myS3.BackupDirectory()
-	if err == nil {
-		t.Fail()
-	}
-}
-
-func TestBackupDirectoryHeadObjectFails(t *testing.T) {
-
-	cfg = models.Config{
-		AWS: models.AWS{
-			S3Region:             "somewhere",
-			S3Bucket:             "testbucket",
-			SecretAccessKey:      "xxxxxxx",
-			AccessKeyId:          "yyyyyyy",
-			BackupDirectories:    nil,
-			ACL:                  "",
-			ContentDisposition:   "",
-			ServerSideEncryption: "",
-			StorageClass:         "",
-		},
-		Logging: models.Logging{},
-	}
-	fakes3api = new(s3api.FakeS3API)
-	//fakes3api.PutObjectReturns(&s3.PutObjectOutput{}, nil)
-	//lastModified, err := time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
-	fakes3api.HeadObjectReturns(&s3.HeadObjectOutput{}, errors.New("something went wrong"))
-	myTime, _ = time.Parse("2 Jan 06 03:04PM", "10 Nov 10 11:00PM")
-	myS3 := s3backup.New(cfg, fakes3api, testDirectory, &l)
-
-	err = myS3.BackupDirectory()
-	if err != nil {
-		t.Fatalf("expected nil error, got %v", err)
-	}
-}
-
-func TestSetConfig(t *testing.T) {
-
-	setConfigTests := []struct {
-		name        string
-		dir         string
-		expectedErr error
-		cfg         models.Config
-	}{
-		{name: "test1", expectedErr: nil, cfg: models.Config{
-			AWS:     models.AWS{},
-			Logging: models.Logging{},
-		},
-			dir: "cases",
-		},
-	}
-	for _, cases := range setConfigTests {
-		backup = s3backup.New(cases.cfg, svc, cases.dir, &l)
-		err = backup.SetConfig(cases.cfg)
-		if err != cases.expectedErr {
-			t.Errorf("wanted %q: got: %v", cases.expectedErr, err.Error())
-		}
-	}
-}
-
-func TestSetAWSS3(t *testing.T) {
+// TestBackupDirectory verifies timestamp decisions, upload metadata, and tolerated failures.
+func TestBackupDirectory(t *testing.T) {
 	tests := []struct {
-		name   string
-		expect error
-		cfg    models.Config
+		name       string
+		remote     time.Time
+		headErr    error
+		putErr     error
+		acl        string
+		wantUpload bool
 	}{
-		{name: "test1", expect: nil, cfg: models.Config{
-			AWS:     models.AWS{},
-			Logging: models.Logging{},
-		},
-		},
+		{name: "new file", wantUpload: true},
+		{name: "unchanged file", remote: time.Unix(10000, 0)},
+		{name: "newer remote file", remote: time.Unix(20000, 0)},
+		{name: "head failure still uploads", headErr: errTestS3, wantUpload: true},
+		{name: "missing remote file", headErr: &s3types.NotFound{}, wantUpload: true},
+		{name: "upload failure is tolerated", putErr: errTestS3, wantUpload: true},
+		{name: "configured ACL", acl: "private", wantUpload: true},
+		{name: "normalized ACL", acl: " PRIVATE ", wantUpload: true},
+		{name: "invalid ACL", acl: "invalid"},
 	}
-	for _, test := range tests {
-		backup = s3backup.New(test.cfg, svc, "/etc", &l)
-		err = backup.SetAWSS3(svc)
-		if err != nil {
-			t.Errorf("wanted %q: got: %v", test.expect, err.Error())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			file := filepath.Join(dir, "sample.txt")
+			if err := os.WriteFile(file, []byte("hello"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			local := time.Unix(10000, 0)
+			if err := os.Chtimes(file, local, local); err != nil {
+				t.Fatal(err)
+			}
+			cfg := models.Config{AWS: models.AWS{S3Bucket: "testbucket", ACL: tt.acl, ContentDisposition: "attachment", ServerSideEncryption: "AES256", StorageClass: "STANDARD"}}
+			fake := new(s3api.FakeS3API)
+			fake.HeadObjectReturns(&s3.HeadObjectOutput{LastModified: &tt.remote}, tt.headErr)
+			fake.PutObjectReturns(&s3.PutObjectOutput{}, tt.putErr)
+			logger := zerolog.Nop()
+			runner := s3backup.New(cfg, fake, dir, &logger)
+			if err := runner.BackupDirectory(); err != nil {
+				t.Fatalf("BackupDirectory(): %v", err)
+			}
+			input := fake.LastPutObjectInput
+			if (input != nil) != tt.wantUpload {
+				t.Fatalf("upload = %v, want %v", input != nil, tt.wantUpload)
+			}
+			if input == nil {
+				return
+			}
+			if *input.Bucket != cfg.AWS.S3Bucket || *input.Key != file {
+				t.Fatalf("unexpected destination: %+v", input)
+			}
+			if *input.ContentLength != 5 || *input.ContentType != "text/plain; charset=utf-8" {
+				t.Fatalf("unexpected content metadata: %+v", input)
+			}
+			if *input.ContentDisposition != "attachment" || input.ServerSideEncryption != "AES256" || input.StorageClass != "STANDARD" {
+				t.Fatalf("unexpected upload options: %+v", input)
+			}
+			if tt.acl != "" && input.ACL != s3types.ObjectCannedACLPrivate {
+				t.Fatalf("ACL = %q", input.ACL)
+			}
+			if tt.acl == "" && input.ACL != "" {
+				t.Fatalf("unexpected ACL %q", input.ACL)
+			}
+		})
+	}
+}
+
+// TestBackupDirectoryFilesystem covers empty, missing, and nonregular paths.
+func TestBackupDirectoryFilesystem(t *testing.T) {
+	dir := t.TempDir()
+	fake := new(s3api.FakeS3API)
+	runner := s3backup.New(models.Config{}, fake, dir, nil)
+	if err := runner.BackupDirectory(); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink("missing", link); err == nil {
+		if err := runner.BackupDirectory(); err != nil {
+			t.Fatal(err)
 		}
 	}
-}
-
-func TestSetDirectory(t *testing.T) {
-	tests := []struct {
-		name   string
-		expect error
-		cfg    models.Config
-	}{
-		{name: "test1", expect: nil, cfg: models.Config{
-			AWS:     models.AWS{},
-			Logging: models.Logging{},
-		},
-		},
+	if fake.LastPutObjectInput != nil {
+		t.Fatal("empty directory or symlink triggered upload")
 	}
-	for _, test := range tests {
-		backup = s3backup.New(test.cfg, svc, "/etc", &l)
-		err = backup.SetDirectory("")
-		if err != nil {
-			t.Errorf("wanted %q: got: %v", test.expect, err.Error())
-		}
+	if err := runner.SetDirectory(filepath.Join(dir, "missing")); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.BackupDirectory(); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("error = %v, want missing path", err)
 	}
 }
 
-func TestBackupDirectorySetsConfiguredACL(t *testing.T) {
-	tmpDir := t.TempDir()
-	tmpFile := filepath.Join(tmpDir, "sample.txt")
-	if writeErr := os.WriteFile(tmpFile, []byte("hello"), 0o600); writeErr != nil {
-		t.Fatalf("unable to create temp file: %v", writeErr)
+// TestSetters verifies that changed dependencies and configuration affect the next backup.
+func TestSetters(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "file"), nil, 0o600); err != nil {
+		t.Fatal(err)
 	}
-
-	cfg = models.Config{
-		AWS: models.AWS{
-			S3Region:             "us-east-1",
-			S3Bucket:             "testbucket",
-			ACL:                  "private",
-			ContentDisposition:   "attachment",
-			ServerSideEncryption: "AES256",
-			StorageClass:         "STANDARD",
-		},
-		Logging: models.Logging{},
+	runner := s3backup.New(models.Config{}, nil, "missing", nil)
+	cfg := models.Config{AWS: models.AWS{S3Bucket: "replacement"}}
+	fake := new(s3api.FakeS3API)
+	if err := runner.SetConfig(cfg); err != nil {
+		t.Fatal(err)
 	}
-
-	fakes3api = new(s3api.FakeS3API)
-	fakes3api.PutObjectReturns(&s3.PutObjectOutput{}, nil)
-	old := time.Unix(0, 0).UTC()
-	fakes3api.HeadObjectReturns(&s3.HeadObjectOutput{LastModified: &old}, nil)
-
-	backupRunner := s3backup.New(cfg, fakes3api, tmpDir, &l)
-	if backupErr := backupRunner.BackupDirectory(); backupErr != nil {
-		t.Fatalf("BackupDirectory() returned unexpected error: %v", backupErr)
+	if err := runner.SetAWSS3(fake); err != nil {
+		t.Fatal(err)
 	}
-
-	if fakes3api.LastPutObjectInput == nil {
-		t.Fatalf("expected PutObject to be called")
+	if err := runner.SetDirectory(dir); err != nil {
+		t.Fatal(err)
 	}
-	if fakes3api.LastPutObjectInput.ACL != s3types.ObjectCannedACLPrivate {
-		t.Fatalf("expected ACL %q, got %q", s3types.ObjectCannedACLPrivate, fakes3api.LastPutObjectInput.ACL)
+	if err := runner.BackupDirectory(); err != nil {
+		t.Fatal(err)
+	}
+	if fake.LastPutObjectInput == nil || *fake.LastPutObjectInput.Bucket != "replacement" {
+		t.Fatal("setters did not update backup dependencies")
 	}
 }
 
-func TestBackupDirectorySkipsPutObjectOnInvalidACL(t *testing.T) {
-	tmpDir := t.TempDir()
-	tmpFile := filepath.Join(tmpDir, "sample.txt")
-	if writeErr := os.WriteFile(tmpFile, []byte("hello"), 0o600); writeErr != nil {
-		t.Fatalf("unable to create temp file: %v", writeErr)
-	}
-
-	cfg = models.Config{
-		AWS: models.AWS{
-			S3Region:             "us-east-1",
-			S3Bucket:             "testbucket",
-			ACL:                  "not-a-real-acl",
-			ContentDisposition:   "attachment",
-			ServerSideEncryption: "AES256",
-			StorageClass:         "STANDARD",
-		},
-		Logging: models.Logging{},
-	}
-
-	fakes3api = new(s3api.FakeS3API)
-	fakes3api.PutObjectReturns(&s3.PutObjectOutput{}, nil)
-	old := time.Unix(0, 0).UTC()
-	fakes3api.HeadObjectReturns(&s3.HeadObjectOutput{LastModified: &old}, nil)
-
-	backupRunner := s3backup.New(cfg, fakes3api, tmpDir, &l)
-	if backupErr := backupRunner.BackupDirectory(); backupErr != nil {
-		t.Fatalf("BackupDirectory() returned unexpected error: %v", backupErr)
-	}
-
-	if fakes3api.LastPutObjectInput != nil {
-		t.Fatalf("expected PutObject not to be called for invalid ACL")
+// TestBackupDirectoryCancellation checks the optional context-aware API.
+func TestBackupDirectoryCancellation(t *testing.T) {
+	runner := s3backup.New(models.Config{}, new(s3api.FakeS3API), t.TempDir(), nil)
+	contextual := runner.(interface{ BackupDirectoryContext(context.Context) error })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := contextual.BackupDirectoryContext(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want canceled", err)
 	}
 }

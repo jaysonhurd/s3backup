@@ -3,15 +3,17 @@ package utilities
 import (
 	"context"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
+	"log/slog"
 	"os"
 	"path"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/jaysonhurd/s3backup/internal/logging"
 	"github.com/jaysonhurd/s3backup/models"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
@@ -29,6 +31,7 @@ const (
 		`
 )
 
+// CreateAWSSession loads AWS configuration with optional explicit credentials.
 func CreateAWSSession(cfg models.Config, l *zerolog.Logger) (aws.Config, error) {
 	loadOpts := []func(*config.LoadOptions) error{
 		config.WithRegion(cfg.AWS.S3Region),
@@ -43,7 +46,7 @@ func CreateAWSSession(cfg models.Config, l *zerolog.Logger) (aws.Config, error) 
 	awsCfg, err := config.LoadDefaultConfig(context.Background(), loadOpts...)
 	if err != nil {
 		if l != nil {
-			l.Error().Err(err).Msg(msgLoadAWSConfigFailed)
+			logging.FromLegacy(l).Error(msgLoadAWSConfigFailed, slog.Any("error", err))
 		}
 		return aws.Config{}, err
 	}
@@ -51,6 +54,7 @@ func CreateAWSSession(cfg models.Config, l *zerolog.Logger) (aws.Config, error) 
 	return awsCfg, nil
 }
 
+// LoadConfig reads JSON configuration while retaining legacy field matching.
 func LoadConfig(configFile string) (models.Config, error) {
 	var BackupConfig models.Config
 	_, err := os.Stat(configFile)
@@ -61,13 +65,14 @@ func LoadConfig(configFile string) (models.Config, error) {
 	if err != nil {
 		return BackupConfig, err
 	}
-	err = json.Unmarshal(f, &BackupConfig)
+	err = jsonv2.Unmarshal(f, &BackupConfig, json.DefaultOptionsV1())
 	if err != nil {
 		return BackupConfig, err
 	}
 	return BackupConfig, err
 }
 
+// LoggerSetup creates rotating logs, defaulting to logs/s3backup.log.
 func LoggerSetup(cfg models.Config, llevel zerolog.Level) (*zerolog.Logger, error) {
 	var (
 		l   zerolog.Logger
@@ -77,6 +82,12 @@ func LoggerSetup(cfg models.Config, llevel zerolog.Level) (*zerolog.Logger, erro
 	zerolog.SetGlobalLevel(llevel)
 
 	logFileName := "s3backup.log"
+	if cfg.Logging.LogfileLocation == "" {
+		cfg.Logging.LogfileLocation = "logs"
+	}
+	if err := os.MkdirAll(cfg.Logging.LogfileLocation, 0o700); err != nil {
+		return nil, err
+	}
 
 	lfile := zerolog.New(&lumberjack.Logger{
 		Filename:   path.Join(cfg.Logging.LogfileLocation, logFileName),
@@ -96,6 +107,7 @@ func LoggerSetup(cfg models.Config, llevel zerolog.Level) (*zerolog.Logger, erro
 	return &l, err
 }
 
+// PrintHelp prints supported command options.
 func PrintHelp() {
-	log.Info().Msg(msgProgramUsageHelp)
+	slog.Info(msgProgramUsageHelp)
 }

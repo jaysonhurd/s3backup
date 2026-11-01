@@ -1,6 +1,19 @@
-config.json
+# Local configuration and required test fixtures.
+*.json
 !fixtures/tests/*.json
+# IDE and local agent state.
+.idea/
+.vscode/
+.codex/
+*.iml
 go_build*
 ./idea*
 .idea*
-go.sum
+# Generated logs, build outputs, and Python caches.
+*.log
+logs/*
+!logs/.gitkeep
+/dist/
+/s3backup
+__pycache__/
+*.pyc

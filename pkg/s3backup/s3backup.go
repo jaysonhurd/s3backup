@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,6 +16,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/jaysonhurd/s3backup/internal/logging"
+	"github.com/jaysonhurd/s3backup/internal/telemetry"
 	"github.com/jaysonhurd/s3backup/models"
 	"github.com/rs/zerolog"
 )
@@ -49,12 +52,10 @@ var objectACLMap = map[string]s3types.ObjectCannedACL{
 
 //go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 -o ../../test/fakes/s3api/s3api.go github.com/jaysonhurd/s3backup/pkg/s3backup/.S3API
 
-var (
-	err error
-	//file fs.File
-	file *os.File
-)
+// ErrUnsupportedObjectACL indicates an unsupported configured canned ACL.
+var ErrUnsupportedObjectACL = errors.New("unsupported object ACL value")
 
+// S3backuper defines backup operations and configuration updates.
 type S3backuper interface {
 	BackupDirectory() error
 	SetConfig(cfg models.Config) error
@@ -62,18 +63,21 @@ type S3backuper interface {
 	SetDirectory(dir string) error
 }
 
+// S3API defines the S3 operations consumed by this package.
 type S3API interface {
 	HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
 	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 }
 
+// s3backup supports s3backup.
 type s3backup struct {
 	cfg models.Config
 	svc S3API
 	dir string
-	l   *zerolog.Logger
+	l   *slog.Logger
 }
 
+// New constructs a runner with explicit configuration and S3 dependencies.
 func New(
 	cfg models.Config,
 	svc S3API,
@@ -84,20 +88,23 @@ func New(
 		cfg: cfg,
 		svc: svc,
 		dir: dir,
-		l:   l,
+		l:   logging.FromLegacy(l),
 	}
 }
 
+// SetConfig replaces configuration for subsequent backups.
 func (b *s3backup) SetConfig(cfg models.Config) (err error) {
 	b.cfg = cfg
 	return nil
 }
 
+// SetAWSS3 replaces the S3 client for subsequent backups.
 func (b *s3backup) SetAWSS3(svc S3API) (err error) {
 	b.svc = svc
 	return nil
 }
 
+// SetDirectory sets the directory for subsequent backups.
 func (b *s3backup) SetDirectory(dir string) (err error) {
 	b.dir = dir
 	return nil
@@ -106,28 +113,40 @@ func (b *s3backup) SetDirectory(dir string) (err error) {
 // This method backs up an enitre directory structure from the config.json file.
 // It will structure the file structure in S3 exactly as it is on the local filesystem.
 func (b *s3backup) BackupDirectory() (err error) {
+	return b.BackupDirectoryContext(context.Background())
+}
+
+// BackupDirectoryContext backs up files while honoring cancellation.
+func (b *s3backup) BackupDirectoryContext(ctx context.Context) (err error) {
+	ctx, finish := telemetry.Start(ctx, "backup.directory")
+	defer func() { finish(err) }()
 
 	err = filepath.WalkDir(b.dir, func(path string, info fs.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 
 		if err != nil {
-			b.l.Error().Err(err).Str("path", path).Msg(msgWalkFilesystemError)
+			b.l.Error(msgWalkFilesystemError, slog.Any("error", err), slog.String("path", path))
 			return err
 		}
 
 		if info.IsDir() {
-			b.l.Debug().Str("path", path).Msg(msgSkipDirectory)
+			b.l.Debug(msgSkipDirectory, slog.String("path", path))
 			return nil
 		}
 
 		if !info.Type().IsRegular() {
-			b.l.Debug().Str("path", path).Msg(msgSkipNonRegularFile)
+			b.l.Debug(msgSkipNonRegularFile, slog.String("path", path))
 			return nil
 		}
 
-		s3objectTime, err := b.s3FileTimestamp(b.cfg, path)
+		s3objectTime, err := b.s3FileTimestamp(ctx, b.cfg, path)
 		if err != nil {
-			b.l.Error().Err(err).Str("path", path).Msg(msgGetS3TimestampError)
-			//return err
+			b.l.Error(msgGetS3TimestampError, slog.Any("error", err), slog.String("path", path))
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 		}
 
 		// Error checking here is for good measure but would likely never be reached.
@@ -135,23 +154,26 @@ func (b *s3backup) BackupDirectory() (err error) {
 		// (microseconds).  This proved too difficult to write a test for.
 		localFileTime, err := b.localFileTimestamp(path)
 		if err != nil {
-			b.l.Error().Err(err).Str("path", path).Msg(msgGetLocalTimestampError)
+			b.l.Error(msgGetLocalTimestampError, slog.Any("error", err), slog.String("path", path))
+			return nil
 		}
 		if localFileTime.After(s3objectTime) {
-			b.l.Info().Str("path", path).Str("storage_class", b.cfg.AWS.StorageClass).Msg(msgBackingUpFile)
-			err = b.uploadFileToS3(path)
+			b.l.Info(msgBackingUpFile, slog.String("path", path), slog.String("storage_class", b.cfg.AWS.StorageClass))
+			err = b.uploadFileToS3(ctx, path)
 			if err != nil {
-				b.l.Error().Err(err).Str("path", path).Msg(msgUploadToS3Error)
-				//return err
+				b.l.Error(msgUploadToS3Error, slog.Any("error", err), slog.String("path", path))
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
 			}
 		} else {
-			b.l.Info().Str("path", path).Msg(msgSkippingFile)
+			b.l.Info(msgSkippingFile, slog.String("path", path))
 		}
 		return nil
 	})
 
 	if err != nil {
-		b.l.Error().Err(err).Str("root_dir", b.dir).Msg(msgWalkRootPathError)
+		b.l.Error(msgWalkRootPathError, slog.Any("error", err), slog.String("root_dir", b.dir))
 		return err
 	}
 	return nil
@@ -159,20 +181,18 @@ func (b *s3backup) BackupDirectory() (err error) {
 
 // localFileTimestamp - gets the file timestamp of a given file on the local filesystem.
 func (b *s3backup) localFileTimestamp(file string) (time.Time, error) {
-	var filestat fs.FileInfo
-	filestat, err = os.Stat(file)
+	filestat, err := os.Stat(file)
 	if err != nil {
-		b.l.Error().Err(err).Str("file", file).Msg(msgLocalFileStatError)
+		b.l.Error(msgLocalFileStatError, slog.Any("error", err), slog.String("file", file))
 		return time.Now(), err
 	}
 	return filestat.ModTime(), nil
 }
 
 // s3FileTimestamp - gets the file timestamp of a given file in S3
-func (b *s3backup) s3FileTimestamp(cfg models.Config, file string) (time.Time, error) {
+func (b *s3backup) s3FileTimestamp(ctx context.Context, cfg models.Config, file string) (time.Time, error) {
 
 	var (
-		result *s3.HeadObjectOutput
 		epoch  time.Time
 		apiErr smithy.APIError
 		nfErr  *s3types.NotFound
@@ -183,7 +203,7 @@ func (b *s3backup) s3FileTimestamp(cfg models.Config, file string) (time.Time, e
 		Key:    aws.String(file),
 	}
 
-	result, err = b.svc.HeadObject(context.Background(), &input)
+	result, err := b.svc.HeadObject(ctx, &input)
 
 	if err != nil {
 		epoch = time.Date(1970, 01, 01, 01, 01, 01, 1, time.UTC)
@@ -203,12 +223,14 @@ func (b *s3backup) s3FileTimestamp(cfg models.Config, file string) (time.Time, e
 	return *result.LastModified, nil
 }
 
-// s3FileTimestamp - Upload file to S3
-func (b *s3backup) uploadFileToS3(fileName string) error {
+// uploadFileToS3 streams a local file with configured object metadata.
+func (b *s3backup) uploadFileToS3(ctx context.Context, fileName string) (err error) {
+	ctx, finish := telemetry.Start(ctx, "backup.upload")
+	defer func() { finish(err) }()
 
-	fileName, file, err = b.openFile(fileName)
+	fileName, file, err := b.openFile(fileName)
 	if err != nil {
-		b.l.Error().Err(err).Msg(msgOpenFileError)
+		b.l.Error(msgOpenFileError, slog.Any("error", err))
 		return err
 	}
 
@@ -216,25 +238,25 @@ func (b *s3backup) uploadFileToS3(fileName string) error {
 
 	fileInfo, statErr := file.Stat()
 	if statErr != nil {
-		b.l.Error().Err(statErr).Msg(msgLocalFileStatError)
+		b.l.Error(msgLocalFileStatError, slog.Any("error", statErr))
 		return statErr
 	}
 
 	header := make([]byte, 512)
 	n, err := file.Read(header)
 	if err != nil && !errors.Is(err, io.EOF) {
-		b.l.Error().Err(err).Msg(msgReadFileBufferError)
+		b.l.Error(msgReadFileBufferError, slog.Any("error", err))
 		return err
 	}
 
 	if _, err = file.Seek(0, 0); err != nil {
-		b.l.Error().Err(err).Msg(msgSeekFileError)
+		b.l.Error(msgSeekFileError, slog.Any("error", err))
 		return err
 	}
 
 	objectACL, err := objectCannedACLFromString(b.cfg.AWS.ACL)
 	if err != nil {
-		b.l.Error().Err(err).Str("acl", b.cfg.AWS.ACL).Msg(msgInvalidObjectACL)
+		b.l.Error(msgInvalidObjectACL, slog.Any("error", err), slog.String("acl", b.cfg.AWS.ACL))
 		return err
 	}
 
@@ -252,15 +274,16 @@ func (b *s3backup) uploadFileToS3(fileName string) error {
 		putObject.ACL = objectACL
 	}
 
-	_, err = b.svc.PutObject(context.Background(), &putObject)
+	_, err = b.svc.PutObject(ctx, &putObject)
 
 	if err != nil {
-		b.l.Error().Err(err).Msg(msgPutObjectError)
+		b.l.Error(msgPutObjectError, slog.Any("error", err))
 		return err
 	}
 	return nil
 }
 
+// objectCannedACLFromString normalizes and validates an optional canned ACL.
 func objectCannedACLFromString(acl string) (s3types.ObjectCannedACL, error) {
 	trimmed := strings.TrimSpace(acl)
 	if trimmed == "" {
@@ -268,14 +291,18 @@ func objectCannedACLFromString(acl string) (s3types.ObjectCannedACL, error) {
 	}
 	mapped, ok := objectACLMap[strings.ToLower(trimmed)]
 	if !ok {
-		return "", errors.New("unsupported object ACL value")
+		return "", ErrUnsupportedObjectACL
 	}
 	return mapped, nil
 }
 
+// openFile resolves and opens a local file for upload.
 func (b *s3backup) openFile(fileName string) (string, *os.File, error) {
-	fileName, _ = filepath.Abs(fileName)
-	file, err = os.Open(fileName)
+	fileName, err := filepath.Abs(fileName)
+	if err != nil {
+		return "", nil, err
+	}
+	file, err := os.Open(fileName)
 	if err != nil {
 		return "", nil, err
 	}
