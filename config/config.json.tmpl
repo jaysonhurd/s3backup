@@ -1,13 +1,18 @@
 {
-  "S3Region": "<AWS_REGION_HERE>",
-  "S3Bucket": "<BUCKET_NAME_HERE>",
-  "AccessKeyId": "<AWS_ACCESS_KEY_HERE>",
-  "SecretAccessKey": "<AWS_SECRET_ACCESS_KEY_HERE>",
-  "BackupDirs": [ "/home/home/Documents", "/home/homer/Downloads", "/home/homer/Pictures" ],
-  "ACL": "private",
-  "ContentDisposition": "attachment",
-  "ServerSideEncryption": "AES256",
-  "StorageClass": "STANDARD"
+  "AWS": {
+    "S3Region": "<AWS_REGION_HERE>",
+    "S3Bucket": "<BUCKET_NAME_HERE>",
+    "BackupDirectories": ["/home/user/Documents"],
+    "ACL": "private",
+    "ContentDisposition": "attachment",
+    "ServerSideEncryption": "AES256",
+    "StorageClass": "STANDARD"
+  },
+  "logging": {
+    "logfile_location": "logs",
+    "max_backups": 4,
+    "max_size": 10,
+    "max_age": 7,
+    "Console": false
+  }
 }
-
-

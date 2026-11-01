@@ -10,6 +10,28 @@ You can either download a pre-built executable from the [Releases](https://githu
 
 ## Installation
 
+### Build from Source
+
+Install [Go 1.27.3](https://go.dev/dl/) or later, then run these commands from
+the repository root:
+
+```bash
+go mod download
+go build -o s3backup ./cmd
+```
+
+To validate changes locally:
+
+```bash
+go mod verify
+go build ./...
+go test ./...
+go vet ./...
+```
+
+The release workflow reads the required Go version from `go.mod` and builds
+the platforms listed below.
+
 ### Download Pre-built Executables
 
 Pre-built executables for multiple platforms are available on the [Releases](https://github.com/jaysonhurd/s3backup/releases) page.
@@ -59,8 +81,9 @@ need to first create from within your AWS account:
 Many of the above configs should be relatively straightforward.  A few caveats: 
 - `StorageClass`: Storage classes for AWS S3 can be found [here](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html).  The default in the config file is 
 `GLACIER`.
-- `logfile_location`: Make sure to put your logfile in a valid location.  Also be sure to build some sort of logfile
-rotator since this release of `S3Backup` does not rotate logs and they may grow to fill the disk.
+- `logfile_location`: Directory containing the rotating `s3backup.log` file. An empty
+  value defaults to `logs`. Rotation uses `max_size` (MiB), `max_backups`, and
+  `max_age` (days).
 
 ## Usage
 
@@ -118,3 +141,43 @@ Sync S3 with local filesystem and enable console logs:
 ./s3backup -config ./config/config.json -sync -console -llevel info
 ```
 
+
+## Development checks
+
+Use Go 1.27.3 or later, Python 3.9+, Git, Bash, and a C compiler for the Go
+race detector. Run the same checks as CI from the repository root:
+
+```bash
+bash scripts/validate.sh
+```
+
+The `Repository validation` check runs on pull requests to and pushes to `main`.
+It checks Go formatting, module checksums, build, race-tested unit tests, coverage,
+and vet, plus basic skill metadata, local Markdown links and anchors, and shell
+syntax. The Python checker uses Git's tracked and nonignored files; local `.codex`
+skills and IDE state are ignored. It does not validate external links, full YAML,
+GitHub enforcement, skill behavior, or live AWS behavior. Coverage is reported;
+95% is a goal, not an enforced threshold. CLI exits and filesystem/S3 failures
+that require integration testing remain coverage limitations.
+
+### Logging and telemetry
+
+Internal operations use `log/slog` with structured attributes. Existing public
+zerolog arguments remain supported through an internal adapter, retaining caller
+output and filtering. An empty `logfile_location` defaults to `logs/s3backup.log`;
+explicit paths and rotating logs remain supported. Never commit generated logs.
+
+OpenTelemetry API dependencies provide spans and operation-count/duration metrics
+for backup, uploads, wipe, and sync. They use caller-owned global providers and
+are no-ops until the host installs providers. This CLI currently configures no
+exporter: no collector address or credentials are assumed and no telemetry is
+sent by default. A host enabling an SDK owns its flush and shutdown lifecycle;
+see the [OpenTelemetry Go instrumentation guide](https://opentelemetry.io/docs/languages/go/instrumentation/).
+`BackupDirectoryContext`, `WipeS3BucketContext`, and `SyncS3BucketContext` are
+available through optional interfaces on constructor results; legacy interfaces
+remain unchanged. Configure setters before starting concurrent work on a runner.
+
+Configuration decoding uses `encoding/json/v2` with v1 compatibility options,
+including case-insensitive matching for existing lowercase `logging` objects.
+The ignored JSON exception is `fixtures/tests/*.json`; no files currently match.
+Spec Kit is not installed; this update does not initialize it.
